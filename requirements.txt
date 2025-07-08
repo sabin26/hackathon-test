@@ -1,0 +1,8 @@
+opencv-python
+numpy<2.0.0
+pandas
+joblib
+torch
+torchvision
+scikit-learn
+git+https://github.com/iMoonLab/yolov13
