@@ -1,6 +1,6 @@
 # Sports Analytics Configuration File
 video:
-    path: 'sample_video.mp4'
+    path: 'sample.mp4'
     supported_formats: ['.mp4', '.avi', '.mov', '.mkv']
     min_resolution: [320, 240]
     max_resolution: [4096, 2160]
