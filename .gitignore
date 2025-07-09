@@ -11,3 +11,10 @@ wheels/
 
 # Log files
 *.log
+
+# CSV files
+*.csv
+*.csv.*
+
+# Checkpoints
+analyzer_checkpoints/
