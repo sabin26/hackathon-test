@@ -26,7 +26,7 @@ logging.basicConfig(
 class Config:
     """Configuration with parameter hashing for robust checkpointing."""
     # --- MANDATORY: UPDATE THIS PATH ---
-    VIDEO_PATH = 'path/to/your/soccer_game.mp4'
+    VIDEO_PATH = 'sample_video.mp4'  # Change from placeholder path
     
     # --- OPTIONAL: Change output file name if desired ---
     OUTPUT_CSV_PATH = 'enterprise_analytics_output.csv'
@@ -134,7 +134,7 @@ class SegmentationModel:
 
 # --- 3. OBJECT TRACKER ---
 class ObjectTracker:
-    """Encapsulates the YOLOv8 object tracker."""
+    """Encapsulates the YOLO object tracker."""
     def __init__(self, model_path):
         self.model = YOLO(model_path)
         logging.info(f"Object tracker initialized with model: {model_path}")
@@ -254,13 +254,14 @@ class HomographyManager:
 
 # --- 5. TEAM IDENTIFIER ---
 class TeamIdentifier:
-    """Efficiently collects example crops for a superior HITL experience."""
+    """Efficiently collects crops for a superior HITL experience."""
     def __init__(self, n_clusters):
         self.kmeans = KMeans(n_clusters=n_clusters, n_init='auto', random_state=42)
         self.team_map: Optional[dict] = None
         self.is_fitted = False
         self.feature_samples = []
         self.example_crops = defaultdict(list)
+        self.crop_samples = []  # Store crops alongside features
 
     def _extract_player_features(self, frame: np.ndarray, bbox: list) -> Optional[np.ndarray]:
         """Creates a feature vector (color histogram) from a player's torso."""
@@ -277,24 +278,37 @@ class TeamIdentifier:
         return hist.flatten()
 
     def collect_and_store_sample(self, frame: np.ndarray, bbox: list):
-        """Collects feature vector and, if needed, an example crop image."""
+        """Collects feature vector and corresponding crop image."""
         features = self._extract_player_features(frame, bbox)
         if features is not None:
             self.feature_samples.append(features)
             
+            # Always collect crop for HITL display
+            x1, y1, x2, y2 = bbox
+            h, w = y2 - y1, x2 - x1
+            crop_bgr = frame[y1 + int(h * 0.2):y1 + int(h * 0.6), x1 + int(w * 0.2):x1 + int(w * 0.8)]
+            if crop_bgr.size > 0:
+                self.crop_samples.append(cv2.resize(crop_bgr, (50, 50)))
+            else:
+                self.crop_samples.append(np.zeros((50, 50, 3), dtype=np.uint8))
+            
             if self.is_fitted:
                 cluster_id = self.kmeans.predict([features])[0]
                 if len(self.example_crops[cluster_id]) < 10:
-                    x1, y1, x2, y2 = bbox
-                    h, w = y2 - y1, x2 - x1
-                    crop_bgr = frame[y1 + int(h * 0.2):y1 + int(h * 0.6), x1 + int(w * 0.2):x1 + int(w * 0.8)]
                     self.example_crops[cluster_id].append(cv2.resize(crop_bgr, (50, 50)))
 
     def fit(self):
-        """Fits the K-Means model on the collected feature vectors."""
+        """Fits the K-Means model and organizes crops by cluster."""
         logging.info("Fitting team feature model...")
         self.kmeans.fit(self.feature_samples)
         self.is_fitted = True
+        
+        # Organize existing crops by cluster
+        for i, features in enumerate(self.feature_samples):
+            if i < len(self.crop_samples):
+                cluster_id = self.kmeans.predict([features])[0]
+                if len(self.example_crops[cluster_id]) < 10:
+                    self.example_crops[cluster_id].append(self.crop_samples[i])
         logging.info("Team K-Means model fitted. Ready for HITL or loading labels.")
 
     def classify_player(self, frame: np.ndarray, bbox: list) -> str:
@@ -376,16 +390,29 @@ class VideoProcessor:
         logging.info("Calculating robust video hash...")
         hasher = hashlib.md5()
         total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        # Handle very short videos
+        
+        # Handle edge cases for very short videos
+        if total_frames <= 0:
+            # Fallback: use video file stats
+            stat = os.stat(self.config.VIDEO_PATH)
+            hasher.update(str(stat.st_size).encode())
+            hasher.update(str(stat.st_mtime).encode())
+            return hasher.hexdigest()[:16]
+        
+        # Sample frames intelligently
         sample_indices = [0]
+        if total_frames > 2:
+            sample_indices.append(total_frames // 2)
         if total_frames > 1:
-            sample_indices.extend([total_frames // 2, total_frames - 1])
+            sample_indices.append(total_frames - 1)
         
         for idx in sample_indices:
             self.cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
             ret, frame = self.cap.read()
             if ret:
-                hasher.update(frame.tobytes())
+                # Hash a downsampled version for consistency
+                small_frame = cv2.resize(frame, (64, 64))
+                hasher.update(small_frame.tobytes())
             
         self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0) # Rewind for processing
         return hasher.hexdigest()[:16]
@@ -454,7 +481,7 @@ class VideoProcessor:
             logging.error("Incorrect number of labels. Labeling aborted.")
 
     def _processing_loop(self):
-        """The core processing logic running in a separate thread."""
+        """The core processing logic with the corrected HITL preparation."""
         frame_id = 0
         while not self.stop_event.is_set():
             try:
@@ -466,21 +493,23 @@ class VideoProcessor:
 
             objects = self.object_tracker.track_objects(frame)
 
+            # --- Corrected Team ID and HITL workflow ---
             if not self.team_identifier.is_fitted:
-                for obj in objects:
-                    if obj['type'] == 'person':
-                        self.team_identifier.collect_and_store_sample(frame, obj['bbox_video'])
+                # Phase 1: Collect samples
+                if len(self.team_identifier.feature_samples) < self.config.TEAM_SAMPLES_TO_COLLECT:
+                    for obj in objects:
+                        if obj['type'] == 'person':
+                            self.team_identifier.collect_and_store_sample(frame, obj['bbox_video'])
                 
-                if len(self.team_identifier.feature_samples) >= self.config.TEAM_SAMPLES_TO_COLLECT:
+                # Phase 2: Fit model and prepare for HITL when enough samples are collected
+                else:
                     self.team_identifier.fit()
-                    # Now that it's fitted, populate the example crops for the HITL montage
-                    for features in self.team_identifier.feature_samples:
-                        cluster_id = self.team_identifier.kmeans.predict([features])[0]
-                        # This part still needs a link back to the original crop, so we simplify
-                        # by just using the first few players after fitting to get crops.
+                    
+                    # Phase 3: Trigger HITL if no labels were loaded from a checkpoint
                     if not self.team_identifier.team_map:
                         self._perform_visual_hitl()
-            
+
+            # ... (Rest of the processing loop is identical: homography, classification, etc.) ...
             if self.homography_manager.homography_matrix is None:
                 self.homography_manager.calculate_homography(frame)
             
@@ -506,6 +535,8 @@ class VideoProcessor:
         processing_thread.start()
         
         frame_id = 0
+        last_progress_log = 0
+        
         while True:
             if self.stop_event.is_set() and self.frame_queue.empty():
                 break
@@ -517,14 +548,21 @@ class VideoProcessor:
                     self.stop_event.set()
                     time.sleep(2) # Give processing thread time to finish
                     break
-                self.frame_queue.put(frame)
-                frame_id += 1
+                
+                try:
+                    self.frame_queue.put(frame, timeout=1)
+                    frame_id += 1
+                    
+                    # Progress logging every 100 frames
+                    if frame_id - last_progress_log >= 100:
+                        logging.info(f"Processed {frame_id} frames")
+                        last_progress_log = frame_id
+                        
+                except queue.Full:
+                    time.sleep(0.01)
             else:
                 time.sleep(0.01) # Prevent busy-waiting if queue is full
 
-            # Basic visualization can be added here if needed, but it slows down I/O
-            # cv2.imshow('Live Feed', frame)
-            
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 logging.info("'q' pressed, shutting down.")
                 self.stop_event.set()
@@ -546,7 +584,42 @@ class VideoProcessor:
             return
         
         logging.info(f"Normalizing and exporting {len(self.results_data)} frames of data...")
-        df = pd.json_normalize(self.results_data, record_path=['objects'], meta=['frame_id', ['actions', 'event']])
+        
+        # Flatten the data structure for CSV export
+        export_data = []
+        for frame_data in self.results_data:
+            frame_id = frame_data['frame_id']
+            actions = frame_data.get('actions', {})
+            event = actions.get('event', 'None')
+            
+            if frame_data.get('objects'):
+                for obj in frame_data['objects']:
+                    export_data.append({
+                        'frame_id': frame_id,
+                        'event': event,
+                        'object_id': obj.get('id', 'Unknown'),
+                        'object_type': obj.get('type', 'Unknown'),
+                        'team': obj.get('team', 'Unknown'),
+                        'bbox_x1': obj.get('bbox_video', [0, 0, 0, 0])[0],
+                        'bbox_y1': obj.get('bbox_video', [0, 0, 0, 0])[1],
+                        'bbox_x2': obj.get('bbox_video', [0, 0, 0, 0])[2],
+                        'bbox_y2': obj.get('bbox_video', [0, 0, 0, 0])[3],
+                        'pitch_x': obj.get('pos_pitch', [0, 0])[0] if obj.get('pos_pitch') else 0,
+                        'pitch_y': obj.get('pos_pitch', [0, 0])[1] if obj.get('pos_pitch') else 0,
+                    })
+            else:
+                # Frame with no objects
+                export_data.append({
+                    'frame_id': frame_id,
+                    'event': event,
+                    'object_id': 'None',
+                    'object_type': 'None',
+                    'team': 'None',
+                    'bbox_x1': 0, 'bbox_y1': 0, 'bbox_x2': 0, 'bbox_y2': 0,
+                    'pitch_x': 0, 'pitch_y': 0,
+                })
+        
+        df = pd.DataFrame(export_data)
         df.to_csv(self.config.OUTPUT_CSV_PATH, index=False)
         logging.info(f"Data successfully exported to {self.config.OUTPUT_CSV_PATH}")
 
@@ -554,8 +627,26 @@ class VideoProcessor:
 if __name__ == '__main__':
     try:
         config = Config()
+        
+        # Validate video file exists
+        if not os.path.exists(config.VIDEO_PATH):
+            logging.error(f"Video file not found: {config.VIDEO_PATH}")
+            print("Please update VIDEO_PATH in Config class to point to a valid video file.")
+            exit(1)
+        
+        # Validate output directory is writable
+        output_dir = os.path.dirname(config.OUTPUT_CSV_PATH) or '.'
+        if not os.access(output_dir, os.W_OK):
+            logging.error(f"Output directory is not writable: {output_dir}")
+            exit(1)
+        
         processor = VideoProcessor(config)
         processor.start()
         logging.info("Processing complete.")
+        
+    except KeyboardInterrupt:
+        logging.info("Processing interrupted by user.")
     except Exception as e:
-        logging.critical(e, exc_info=True)
+        logging.critical(f"Critical error: {e}", exc_info=True)
+        print(f"Error: {e}")
+        exit(1)
