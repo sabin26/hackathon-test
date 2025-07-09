@@ -11,6 +11,7 @@ import hashlib
 import logging
 import json
 import torch
+import yaml
 from torchvision import transforms
 from ultralytics import YOLO
 from sklearn.cluster import KMeans
@@ -46,47 +47,82 @@ class SystemMetrics:
 # --- 1. ENTERPRISE CONFIGURATION ---
 class Config:
     """Configuration with parameter hashing for robust checkpointing."""
-    # --- MANDATORY: UPDATE THIS PATH ---
-    VIDEO_PATH = 'sample_video.mp4'  # Change from placeholder path
-    
-    # --- OPTIONAL: Change output file name if desired ---
+    # Configuration values (will be overridden by YAML)
+    VIDEO_PATH = 'sample_video.mp4'
     OUTPUT_CSV_PATH = 'enterprise_analytics_output.csv'
-    
-    # --- Directory for storing learned models ---
     CHECKPOINT_DIR = './analyzer_checkpoints'
-    
-    # --- Key parameters that affect model state. Changing these will trigger re-calibration. ---
     MODEL_PARAMS = {
         'TEAM_N_CLUSTERS': 3,
         'TEAM_FEATURE_BINS': 16,
-        'MIN_CROP_SIZE': 100,  # Minimum crop area in pixels
-        'MAX_CROPS_PER_CLUSTER': 15,  # Increased for better HITL
-        'FRAME_SKIP_INTERVAL': 2,  # Process every Nth frame for performance
-        'MAX_PROCESSING_QUEUE_SIZE': 32,  # Reduced queue size
+        'MIN_CROP_SIZE': 100,
+        'MAX_CROPS_PER_CLUSTER': 15,
+        'FRAME_SKIP_INTERVAL': 2,
+        'MAX_PROCESSING_QUEUE_SIZE': 32,
     }
-
-    # --- Paths generated dynamically based on video and parameter hashes ---
-    checkpoint_path_prefix: Optional[str] = None
-    
-    # --- Paths to AI models. Placeholders are used if files don't exist. ---
-    YOLO_MODEL_PATH = 'yolov8n.pt'  # Updated to more recent model
+    YOLO_MODEL_PATH = 'yolov8n.pt'
     SEGMENTATION_MODEL_PATH = 'path/to/your/segmentation_model.pth'
-
-    # --- System behavior parameters ---
-    TEAM_SAMPLES_TO_COLLECT = 300  # Reduced for faster processing
-    HOMOGRAPHY_RECAL_THRESHOLD = 3.0  # Max allowed reprojection error in pixels
-    HOMOGRAPHY_CHECK_INTERVAL = 150  # Check quality every N frames
+    TEAM_SAMPLES_TO_COLLECT = 300
+    HOMOGRAPHY_RECAL_THRESHOLD = 3.0
+    HOMOGRAPHY_CHECK_INTERVAL = 150
     ACTION_SEQUENCE_LENGTH = 30
-    
-    # --- New performance parameters ---
-    FRAME_QUEUE_SIZE = 64  # Reduced to prevent memory issues
+    FRAME_QUEUE_SIZE = 64
     PROCESSING_TIMEOUT = 1.0
     MAX_RETRIES = 3
-
-    # --- Validation constants ---
     MIN_VIDEO_RESOLUTION = (320, 240)
     MAX_VIDEO_RESOLUTION = (4096, 2160)
     SUPPORTED_VIDEO_FORMATS = ['.mp4', '.avi', '.mov', '.mkv']
+    
+    # Path generated dynamically based on video and parameter hashes
+    checkpoint_path_prefix: Optional[str] = None
+    
+    @classmethod
+    def load_from_yaml(cls, yaml_path: str = 'config.yaml') -> None:
+        """Load configuration from YAML file."""
+        try:
+            if not os.path.exists(yaml_path):
+                logging.warning(f"Config file {yaml_path} not found. Using default values.")
+                return
+                
+            with open(yaml_path, 'r') as f:
+                config_data = yaml.safe_load(f)
+                
+            # Update video settings
+            if 'video' in config_data:
+                cls.VIDEO_PATH = config_data['video'].get('path', cls.VIDEO_PATH)
+                cls.SUPPORTED_VIDEO_FORMATS = config_data['video'].get('supported_formats', cls.SUPPORTED_VIDEO_FORMATS)
+                cls.MIN_VIDEO_RESOLUTION = tuple(config_data['video'].get('min_resolution', cls.MIN_VIDEO_RESOLUTION))
+                cls.MAX_VIDEO_RESOLUTION = tuple(config_data['video'].get('max_resolution', cls.MAX_VIDEO_RESOLUTION))
+            
+            # Update output settings
+            if 'output' in config_data:
+                cls.OUTPUT_CSV_PATH = config_data['output'].get('csv_path', cls.OUTPUT_CSV_PATH)
+                cls.CHECKPOINT_DIR = config_data['output'].get('checkpoint_dir', cls.CHECKPOINT_DIR)
+            
+            # Update model paths
+            if 'models' in config_data:
+                cls.YOLO_MODEL_PATH = config_data['models'].get('yolo_path', cls.YOLO_MODEL_PATH)
+                cls.SEGMENTATION_MODEL_PATH = config_data['models'].get('segmentation_path', cls.SEGMENTATION_MODEL_PATH)
+            
+            # Update processing parameters
+            if 'processing' in config_data:
+                proc = config_data['processing']
+                cls.MODEL_PARAMS['TEAM_N_CLUSTERS'] = proc.get('team_n_clusters', cls.MODEL_PARAMS['TEAM_N_CLUSTERS'])
+                cls.MODEL_PARAMS['TEAM_FEATURE_BINS'] = proc.get('team_feature_bins', cls.MODEL_PARAMS['TEAM_FEATURE_BINS'])
+                cls.MODEL_PARAMS['MIN_CROP_SIZE'] = proc.get('min_crop_size', cls.MODEL_PARAMS['MIN_CROP_SIZE'])
+                cls.MODEL_PARAMS['MAX_CROPS_PER_CLUSTER'] = proc.get('max_crops_per_cluster', cls.MODEL_PARAMS['MAX_CROPS_PER_CLUSTER'])
+                cls.MODEL_PARAMS['FRAME_SKIP_INTERVAL'] = proc.get('frame_skip_interval', cls.MODEL_PARAMS['FRAME_SKIP_INTERVAL'])
+                cls.MODEL_PARAMS['MAX_PROCESSING_QUEUE_SIZE'] = proc.get('max_processing_queue_size', cls.MODEL_PARAMS['MAX_PROCESSING_QUEUE_SIZE'])
+                cls.TEAM_SAMPLES_TO_COLLECT = proc.get('team_samples_to_collect', cls.TEAM_SAMPLES_TO_COLLECT)
+                cls.HOMOGRAPHY_RECAL_THRESHOLD = proc.get('homography_recal_threshold', cls.HOMOGRAPHY_RECAL_THRESHOLD)
+                cls.HOMOGRAPHY_CHECK_INTERVAL = proc.get('homography_check_interval', cls.HOMOGRAPHY_CHECK_INTERVAL)
+                cls.ACTION_SEQUENCE_LENGTH = proc.get('action_sequence_length', cls.ACTION_SEQUENCE_LENGTH)
+                cls.PROCESSING_TIMEOUT = proc.get('processing_timeout', cls.PROCESSING_TIMEOUT)
+                cls.MAX_RETRIES = proc.get('max_retries', cls.MAX_RETRIES)
+                
+            logging.info("Configuration loaded from YAML file")
+            
+        except Exception as e:
+            logging.error(f"Error loading config from YAML: {e}")
 
     @classmethod
     def generate_checkpoint_prefix(cls, video_hash: str) -> None:
@@ -1452,6 +1488,8 @@ class VideoProcessor:
 if __name__ == '__main__':
     try:
         config = Config()
+        # Load configuration from YAML
+        config.load_from_yaml()
         
         # Validate configuration
         if not config.validate_config():
