@@ -29,6 +29,7 @@ dependencies = [
     "supervision>=0.22.0",
     "ultralytics",
     "lap>=0.5.12",
+    "google-genai>=1.24.0",
 ]
 
 [tool.uv.sources]

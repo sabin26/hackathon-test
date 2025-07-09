@@ -19,10 +19,13 @@ from collections import deque, defaultdict
 import warnings
 import psutil
 import gc
-import csv
+
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+import base64
+from google import genai
+from google.genai import types
 
 # Professional logging setup to provide clear, timestamped updates
 logging.basicConfig(
@@ -71,9 +74,11 @@ class Config:
     MIN_VIDEO_RESOLUTION = (320, 240)
     MAX_VIDEO_RESOLUTION = (4096, 2160)
     SUPPORTED_VIDEO_FORMATS = ['.mp4', '.avi', '.mov', '.mkv']
-    ENABLE_HITL = True  # Set to False to disable human-in-the-loop labeling
+    ENABLE_HITL = False  # Set to True to enable human-in-the-loop labeling (fallback when Gemini fails)
     ENABLE_HOMOGRAPHY = True  # Set to False to disable homography calibration and use fallback transformation
-    
+    ENABLE_GEMINI_TEAM_ID = True  # Set to True to use Google Gemini for team identification
+    GEMINI_API_KEY = None  # Set your Google Gemini API key here or via environment variable
+
     # Path generated dynamically based on video and parameter hashes
     checkpoint_path_prefix: Optional[str] = None
     
@@ -122,6 +127,11 @@ class Config:
                 cls.MAX_RETRIES = proc.get('max_retries', cls.MAX_RETRIES)
                 cls.ENABLE_HITL = proc.get('enable_hitl', cls.ENABLE_HITL)
                 cls.ENABLE_HOMOGRAPHY = proc.get('enable_homography', cls.ENABLE_HOMOGRAPHY)
+                cls.ENABLE_GEMINI_TEAM_ID = proc.get('enable_gemini_team_id', cls.ENABLE_GEMINI_TEAM_ID)
+
+            # Update Gemini settings
+            if 'gemini' in config_data:
+                cls.GEMINI_API_KEY = config_data['gemini'].get('api_key', cls.GEMINI_API_KEY)
                 
             logging.info("Configuration loaded from YAML file")
             
@@ -1025,6 +1035,225 @@ class TeamIdentifier:
             return "Unknown"
 
 
+# --- 5.1. GEMINI TEAM IDENTIFIER ---
+class GeminiTeamIdentifier:
+    """Uses Google Gemini to automatically identify teams from player crops."""
+
+    def __init__(self, api_key: Optional[str] = None):
+        self.api_key = api_key or os.getenv('GEMINI_API_KEY')
+        self.client = None
+        self._initialize_client()
+
+    def _initialize_client(self) -> None:
+        """Initialize the Gemini client."""
+        try:
+            if not self.api_key:
+                logging.info("Gemini API key not provided. Set GEMINI_API_KEY environment variable or configure in YAML to enable automatic team identification.")
+                return
+
+            self.client = genai.Client(api_key=self.api_key)
+            logging.info("Gemini client initialized successfully")
+
+        except Exception as e:
+            logging.warning(f"Failed to initialize Gemini client: {e}")
+            self.client = None
+
+    def identify_teams(self, example_crops: Dict[int, List[np.ndarray]]) -> Dict[int, str]:
+        """
+        Use Gemini to analyze player crops and identify teams.
+
+        Args:
+            example_crops: Dictionary mapping cluster_id to list of player crop images
+
+        Returns:
+            Dictionary mapping cluster_id to team name
+        """
+        if not self.client:
+            logging.info("Gemini client not initialized. Falling back to default labels.")
+            return self._get_default_labels(list(example_crops.keys()))
+
+        try:
+            # Create a montage of all clusters for analysis
+            montage_image = self._create_analysis_montage(example_crops)
+            if montage_image is None:
+                return self._get_default_labels(list(example_crops.keys()))
+
+            # Convert image to base64 for Gemini
+            image_data = self._image_to_base64(montage_image)
+
+            # Create prompt for team identification
+            cluster_ids = sorted(example_crops.keys())
+            prompt = self._create_team_identification_prompt(cluster_ids)
+
+            # Send to Gemini for analysis
+            response = self._query_gemini(prompt, image_data)
+
+            # Parse response and create team mapping
+            team_mapping = self._parse_gemini_response(response, cluster_ids)
+
+            logging.info(f"Gemini team identification completed: {team_mapping}")
+            return team_mapping
+
+        except Exception as e:
+            logging.error(f"Gemini team identification failed: {e}")
+            return self._get_default_labels(list(example_crops.keys()))
+
+    def _create_analysis_montage(self, example_crops: Dict[int, List[np.ndarray]]) -> Optional[np.ndarray]:
+        """Create a montage image for Gemini analysis."""
+        try:
+            montages = []
+            cluster_ids = sorted(example_crops.keys())
+
+            for cluster_id in cluster_ids:
+                crops = example_crops[cluster_id]
+                if not crops:
+                    continue
+
+                # Take up to 6 representative crops per cluster
+                selected_crops = crops[:6]
+                valid_crops = []
+
+                for crop in selected_crops:
+                    if crop is not None and crop.size > 0 and len(crop.shape) == 3:
+                        if crop.shape[0] > 0 and crop.shape[1] > 0:
+                            # Resize to standard size for consistency
+                            resized_crop = cv2.resize(crop, (80, 80))
+                            valid_crops.append(resized_crop)
+
+                if not valid_crops:
+                    continue
+
+                # Create horizontal strip of crops
+                crop_strip = cv2.hconcat(valid_crops)
+
+                # Add cluster label
+                label_height = 30
+                label_img = np.zeros((label_height, crop_strip.shape[1], 3), dtype=np.uint8)
+                cv2.putText(label_img, f"Cluster {cluster_id}", (10, 20),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+
+                cluster_montage = cv2.vconcat([label_img, crop_strip])
+                montages.append(cluster_montage)
+
+            if not montages:
+                return None
+
+            # Combine all cluster montages
+            final_montage = cv2.vconcat(montages)
+
+            # Resize if too large
+            max_height = 800
+            if final_montage.shape[0] > max_height:
+                scale = max_height / final_montage.shape[0]
+                new_width = int(final_montage.shape[1] * scale)
+                final_montage = cv2.resize(final_montage, (new_width, max_height))
+
+            return final_montage
+
+        except Exception as e:
+            logging.error(f"Failed to create analysis montage: {e}")
+            return None
+
+    def _image_to_base64(self, image: np.ndarray) -> str:
+        """Convert OpenCV image to base64 string."""
+        try:
+            # Convert BGR to RGB
+            rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+            # Encode as JPEG
+            success, buffer = cv2.imencode('.jpg', rgb_image)
+            if not success:
+                raise ValueError("Failed to encode image")
+
+            # Convert to base64
+            image_base64 = base64.b64encode(buffer).decode('utf-8')
+            return image_base64
+
+        except Exception as e:
+            logging.error(f"Failed to convert image to base64: {e}")
+            raise
+
+    def _create_team_identification_prompt(self, cluster_ids: List[int]) -> str:
+        """Create a prompt for Gemini to identify teams."""
+        prompt = f"""
+You are analyzing a sports video to identify different teams and roles. I have clustered players based on their appearance and need you to identify what each cluster represents.
+
+The image shows {len(cluster_ids)} different clusters of players, labeled as Cluster 0, Cluster 1, etc.
+
+Please analyze the uniforms, colors, and appearance of players in each cluster and provide:
+1. A descriptive team name or role for each cluster
+2. Consider common sports scenarios: Team A, Team B, Referees, Goalkeepers, etc.
+
+Respond with ONLY a comma-separated list of labels in the exact order of the clusters shown (Cluster 0, Cluster 1, etc.).
+
+For example, if you see 3 clusters, respond like: "Team Red, Team Blue, Referee"
+
+Important:
+- Provide exactly {len(cluster_ids)} labels
+- Use descriptive names based on uniform colors or roles
+- Keep labels concise (1-3 words)
+- Separate labels with commas only
+"""
+        return prompt
+
+    def _query_gemini(self, prompt: str, image_base64: str) -> str:
+        """Send query to Gemini and get response."""
+        try:
+            if not self.client:
+                raise ValueError("Gemini client not initialized")
+
+            # Create image part for Gemini using the correct format
+            image_part = types.Part.from_bytes(
+                data=base64.b64decode(image_base64),
+                mime_type="image/jpeg"
+            )
+
+            # Send request to Gemini
+            response = self.client.models.generate_content(
+                model='gemini-2.5-flash-lite-preview-06-17',
+                contents=[prompt, image_part]
+            )
+
+            if response and response.text:
+                return response.text.strip()
+            else:
+                logging.warning("Empty response from Gemini")
+                return ""
+
+        except Exception as e:
+            logging.error(f"Gemini query failed: {e}")
+            raise
+
+    def _parse_gemini_response(self, response: str, cluster_ids: List[int]) -> Dict[int, str]:
+        """Parse Gemini response and create team mapping."""
+        try:
+            if not response:
+                return self._get_default_labels(cluster_ids)
+
+            # Split by comma and clean up
+            labels = [label.strip() for label in response.split(',')]
+
+            # Ensure we have the right number of labels
+            if len(labels) != len(cluster_ids):
+                logging.warning(f"Gemini returned {len(labels)} labels but expected {len(cluster_ids)}. Using defaults.")
+                return self._get_default_labels(cluster_ids)
+
+            # Create mapping
+            team_mapping = {}
+            for i, cluster_id in enumerate(cluster_ids):
+                team_mapping[cluster_id] = labels[i] if i < len(labels) else f"Team_{i}"
+
+            return team_mapping
+
+        except Exception as e:
+            logging.error(f"Failed to parse Gemini response: {e}")
+            return self._get_default_labels(cluster_ids)
+
+    def _get_default_labels(self, cluster_ids: List[int]) -> Dict[int, str]:
+        """Get default team labels when Gemini fails."""
+        return {cluster_id: f"Team_{i}" for i, cluster_id in enumerate(cluster_ids)}
+
+
 # --- 6. ACTION RECOGNIZER HARNESS ---
 class ActionRecognizer:
     """Harness for a sequence-based action recognition model."""
@@ -1225,8 +1454,24 @@ class VideoProcessor:
             homography_path = f"{self.config.checkpoint_path_prefix}_homography.npy"
             
             if os.path.exists(team_model_path):
-                self.team_identifier = joblib.load(team_model_path)
-                logging.info("Loaded team identification model from checkpoint.")
+                try:
+                    # Try to load as the new format (dictionary)
+                    team_data = joblib.load(team_model_path)
+                    if isinstance(team_data, dict):
+                        # Restore team identifier from dictionary
+                        self.team_identifier.n_clusters = team_data['n_clusters']
+                        self.team_identifier.kmeans = team_data['kmeans']
+                        self.team_identifier.team_map = team_data['team_map']
+                        self.team_identifier.is_fitted = team_data['is_fitted']
+                        self.team_identifier.feature_samples = team_data['feature_samples']
+                        self.team_identifier.example_crops = defaultdict(list, team_data['example_crops'])
+                        self.team_identifier.crop_samples = team_data['crop_samples']
+                    else:
+                        # Old format - try to load directly (may fail due to lock)
+                        self.team_identifier = team_data
+                    logging.info("Loaded team identification model from checkpoint.")
+                except Exception as load_error:
+                    logging.warning(f"Failed to load team model checkpoint: {load_error}")
                 
             if os.path.exists(homography_path):
                 self.homography_manager.homography_matrix = np.load(homography_path)
@@ -1244,7 +1489,17 @@ class VideoProcessor:
             homography_path = f"{self.config.checkpoint_path_prefix}_homography.npy"
             
             if self.team_identifier.is_fitted and self.team_identifier.team_map:
-                joblib.dump(self.team_identifier, team_model_path)
+                # Create a copy of team_identifier without the lock for pickling
+                team_data = {
+                    'n_clusters': self.team_identifier.n_clusters,
+                    'kmeans': self.team_identifier.kmeans,
+                    'team_map': self.team_identifier.team_map,
+                    'is_fitted': self.team_identifier.is_fitted,
+                    'feature_samples': self.team_identifier.feature_samples,
+                    'example_crops': dict(self.team_identifier.example_crops),
+                    'crop_samples': self.team_identifier.crop_samples
+                }
+                joblib.dump(team_data, team_model_path)
                 logging.info(f"Saved team model to {team_model_path}")
                 
             if self.homography_manager.homography_matrix is not None:
@@ -1458,6 +1713,40 @@ class VideoProcessor:
         except Exception as e:
             logging.error(f"Failed to apply default labels: {e}")
 
+    def _perform_gemini_team_identification(self) -> None:
+        """Use Google Gemini to automatically identify teams from player crops."""
+        try:
+            if not self.config.ENABLE_GEMINI_TEAM_ID:
+                logging.info("Gemini team identification is disabled. Using default labels.")
+                cluster_ids = sorted(self.team_identifier.example_crops.keys())
+                if cluster_ids:
+                    self._use_default_labels(cluster_ids)
+                return
+
+            logging.info("Starting Gemini-based team identification...")
+
+            # Initialize Gemini team identifier
+            gemini_identifier = GeminiTeamIdentifier(self.config.GEMINI_API_KEY)
+
+            # Use Gemini to identify teams
+            team_mapping = gemini_identifier.identify_teams(self.team_identifier.example_crops)
+
+            if team_mapping:
+                self.team_identifier.team_map = team_mapping
+                logging.info(f"Gemini team identification completed: {team_mapping}")
+            else:
+                logging.warning("Gemini team identification failed. Using default labels.")
+                cluster_ids = sorted(self.team_identifier.example_crops.keys())
+                if cluster_ids:
+                    self._use_default_labels(cluster_ids)
+
+        except Exception as e:
+            logging.error(f"Gemini team identification failed: {e}")
+            # Fallback to default labels
+            cluster_ids = sorted(self.team_identifier.example_crops.keys())
+            if cluster_ids:
+                self._use_default_labels(cluster_ids)
+
     def _processing_loop(self) -> None:
         """Enhanced processing loop with frame skipping and better error handling"""
         frame_id = 0
@@ -1520,12 +1809,14 @@ class VideoProcessor:
                         try:
                             self.team_identifier.fit()
                             
-                            # Perform HITL if needed and enabled
+                            # Perform team identification
                             if not self.team_identifier.team_map:
-                                if self.config.ENABLE_HITL:
+                                if self.config.ENABLE_GEMINI_TEAM_ID:
+                                    self._perform_gemini_team_identification()
+                                elif self.config.ENABLE_HITL:
                                     self._perform_visual_hitl()
                                 else:
-                                    # Use default labels when HITL is disabled
+                                    # Use default labels when both Gemini and HITL are disabled
                                     cluster_ids = sorted(self.team_identifier.example_crops.keys())
                                     if cluster_ids:
                                         self._use_default_labels(cluster_ids)
@@ -1801,6 +2092,8 @@ class VideoProcessor:
                 return
             
             # Add metadata to CSV
+            # Escape the JSON configuration to prevent CSV parsing issues
+            config_str = json.dumps(self.config.MODEL_PARAMS).replace('"', "'")
             metadata_rows = [
                 ['# Video Processing Metadata'],
                 [f'# Video Path: {self.config.VIDEO_PATH}'],
@@ -1808,28 +2101,61 @@ class VideoProcessor:
                 [f'# Total Frames: {self.total_frames}'],
                 [f'# Processed Frames: {valid_frames}'],
                 [f'# Video Hash: {self.video_hash}'],
-                [f'# Configuration: {json.dumps(self.config.MODEL_PARAMS)}'],
-                ['# End Metadata', ''],
+                [f'# Configuration: {config_str}'],
+                ['# End Metadata'],
             ]
             
             # Write metadata and data
             with open(self.config.OUTPUT_CSV_PATH, 'w', newline='') as f:
-                writer = csv.writer(f)
+                # Write metadata as plain text comments (not CSV rows)
                 for row in metadata_rows:
-                    writer.writerow(row)
+                    f.write(row[0] + '\n')  # Write each comment as a single line
                 
-            # Append DataFrame
-            df.to_csv(self.config.OUTPUT_CSV_PATH, mode='a', index=False)
+            # Append DataFrame without trailing newline to prevent extra empty row
+            csv_string = df.to_csv(index=False)
+            # Remove the trailing newline that pandas adds
+            csv_string = csv_string.rstrip('\n')
+
+            with open(self.config.OUTPUT_CSV_PATH, 'a', newline='') as f:
+                f.write(csv_string)
             
             logging.info(f"Successfully exported {len(export_data)} rows to {self.config.OUTPUT_CSV_PATH}")
             
             # Verify export
             try:
-                verification_df = pd.read_csv(self.config.OUTPUT_CSV_PATH, comment='#')
-                if len(verification_df) != len(export_data):
-                    logging.warning("Export verification failed: row count mismatch")
+                # Read CSV with more specific parameters to avoid parsing issues
+                verification_df = pd.read_csv(
+                    self.config.OUTPUT_CSV_PATH,
+                    comment='#',
+                    skip_blank_lines=True,
+                    na_filter=False  # Don't convert strings to NaN
+                )
+                expected_rows = len(export_data)
+                actual_rows = len(verification_df)
+
+                # Additional validation: check if we have the expected columns
+                expected_columns = ['frame_id', 'timestamp', 'object_type']
+                if all(col in verification_df.columns for col in expected_columns):
+                    # Filter out any rows that don't have valid frame_id (should be numeric)
+                    try:
+                        valid_rows = verification_df[pd.to_numeric(verification_df['frame_id'], errors='coerce').notna()]
+                        valid_count = len(valid_rows)
+
+                        if valid_count != expected_rows:
+                            logging.warning(f"Export verification failed: expected {expected_rows} rows, got {valid_count} valid rows (raw: {actual_rows})")
+                            if actual_rows != valid_count:
+                                logging.debug(f"Filtered out {actual_rows - valid_count} invalid rows during verification")
+                        else:
+                            logging.info("Export verification successful")
+                    except Exception as filter_error:
+                        logging.debug(f"Could not filter by frame_id: {filter_error}")
+                        if actual_rows != expected_rows:
+                            logging.warning(f"Export verification failed: expected {expected_rows} rows, got {actual_rows}")
+                        else:
+                            logging.info("Export verification successful")
                 else:
-                    logging.info("Export verification successful")
+                    logging.warning(f"Export verification failed: missing expected columns. Found: {list(verification_df.columns)}")
+
             except Exception as e:
                 logging.warning(f"Export verification failed: {e}")
             

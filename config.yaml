@@ -28,8 +28,13 @@ processing:
     processing_timeout: 1.0
     max_retries: 3
     # Feature flags to prevent common errors
-    enable_hitl: true # Disable human-in-the-loop to prevent OpenCV display errors
+    enable_hitl: true
     enable_homography: true # Disable homography calibration to prevent calibration spam
+    enable_gemini_team_id: true # Enable Google Gemini for automatic team identification
+
+# Google Gemini Configuration
+gemini:
+    api_key: null # Set your Google Gemini API key here or use GEMINI_API_KEY environment variable
 
 logging:
     level: 'INFO'
