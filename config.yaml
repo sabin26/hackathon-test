@@ -11,7 +11,7 @@ output:
     log_file: 'sports_analytics.log'
 
 models:
-    yolo_path: 'yolov8n.pt'
+    yolo_path: 'yolov13n.pt'
     segmentation_path: 'path/to/your/segmentation_model.pth'
 
 processing:
