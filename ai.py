@@ -72,6 +72,7 @@ class Config:
     MAX_VIDEO_RESOLUTION = (4096, 2160)
     SUPPORTED_VIDEO_FORMATS = ['.mp4', '.avi', '.mov', '.mkv']
     ENABLE_HITL = True  # Set to False to disable human-in-the-loop labeling
+    ENABLE_HOMOGRAPHY = True  # Set to False to disable homography calibration and use fallback transformation
     
     # Path generated dynamically based on video and parameter hashes
     checkpoint_path_prefix: Optional[str] = None
@@ -120,6 +121,7 @@ class Config:
                 cls.PROCESSING_TIMEOUT = proc.get('processing_timeout', cls.PROCESSING_TIMEOUT)
                 cls.MAX_RETRIES = proc.get('max_retries', cls.MAX_RETRIES)
                 cls.ENABLE_HITL = proc.get('enable_hitl', cls.ENABLE_HITL)
+                cls.ENABLE_HOMOGRAPHY = proc.get('enable_homography', cls.ENABLE_HOMOGRAPHY)
                 
             logging.info("Configuration loaded from YAML file")
             
@@ -492,6 +494,8 @@ class HomographyManager:
         self.max_calibration_attempts = 5
         self.last_calibration_time = 0
         self.calibration_cooldown = 30  # seconds between calibration resets
+        self.consecutive_failures = 0
+        self.max_consecutive_failures = 20  # Stop trying after this many consecutive failures
 
     def calculate_homography(self, frame: np.ndarray) -> bool:
         """Calculates homography using the segmentation mask with improved robustness."""
@@ -502,9 +506,29 @@ class HomographyManager:
             self.calibration_attempts = 0
             self.last_calibration_time = current_time
 
+        # Check if we've had too many consecutive failures
+        if self.consecutive_failures >= self.max_consecutive_failures:
+            # Stop trying for a very long time
+            if current_time - self.last_calibration_time > self.calibration_cooldown * 10:
+                logging.info("Long cooldown period reached after many failures, resetting calibration state")
+                self.calibration_attempts = 0
+                self.consecutive_failures = 0
+                self.last_calibration_time = current_time
+            else:
+                return False
+
         if self.calibration_attempts >= self.max_calibration_attempts:
-            logging.warning("Max calibration attempts reached")
-            return False
+            # Instead of just warning and returning False, try a longer cooldown
+            if current_time - self.last_calibration_time > self.calibration_cooldown * 3:
+                logging.info("Extended cooldown period reached, resetting calibration attempts")
+                self.calibration_attempts = 0
+                self.last_calibration_time = current_time
+            else:
+                # Reduce frequency of warning messages - only warn once per cooldown period
+                if (self.calibration_attempts == self.max_calibration_attempts and
+                    current_time - self.last_calibration_time < 1.0):  # Only warn in first second
+                    logging.warning("Max calibration attempts reached - will retry after extended cooldown")
+                return False
 
         self.calibration_attempts += 1
 
@@ -559,6 +583,7 @@ class HomographyManager:
                 if self._validate_homography_matrix():
                     logging.info("Homography calibrated successfully.")
                     self.calibration_attempts = 0  # Reset on success
+                    self.consecutive_failures = 0  # Reset consecutive failures on success
                     return True
                 else:
                     logging.debug("Homography matrix failed quality validation")
@@ -567,6 +592,8 @@ class HomographyManager:
         except Exception as e:
             logging.error(f"Homography calculation failed: {e}")
 
+        # Increment consecutive failures
+        self.consecutive_failures += 1
         return False
 
     def _detect_lines_robust(self, line_mask: np.ndarray) -> Optional[np.ndarray]:
@@ -584,13 +611,16 @@ class HomographyManager:
             line_mask = cv2.GaussianBlur(line_mask, (3, 3), 0)
 
             param_sets = [
-                (30, 30, 15),  # threshold, minLineLength, maxLineGap - more lenient first
+                (15, 15, 30),  # Very lenient first - lower threshold, shorter lines, bigger gaps
+                (20, 20, 25),  # Very lenient
+                (25, 25, 20),  # Lenient
+                (30, 30, 15),  # threshold, minLineLength, maxLineGap - more lenient
+                (40, 25, 25),  # balanced
                 (50, 50, 10),
-                (20, 20, 20),  # very lenient
                 (70, 70, 5),   # strict
-                (40, 25, 25)   # balanced
             ]
 
+            backup_lines = None
             for threshold, min_length, max_gap in param_sets:
                 try:
                     lines = cv2.HoughLinesP(
@@ -602,9 +632,19 @@ class HomographyManager:
                     if lines is not None and len(lines) >= 4:
                         logging.debug(f"Found {len(lines)} lines with params: {threshold}, {min_length}, {max_gap}")
                         return lines
+                    elif lines is not None and len(lines) >= 2 and backup_lines is None:
+                        # Accept even 2 lines if we're struggling
+                        logging.debug(f"Found only {len(lines)} lines with params: {threshold}, {min_length}, {max_gap} - keeping as backup")
+                        # Continue to try other parameters, but keep this as backup
+                        backup_lines = lines
                 except cv2.error as e:
-                    logging.warning(f"HoughLinesP failed with params {threshold}, {min_length}, {max_gap}: {e}")
+                    logging.debug(f"HoughLinesP failed with params {threshold}, {min_length}, {max_gap}: {e}")
                     continue
+
+            # If we couldn't find 4+ lines but found some lines, return what we have
+            if backup_lines is not None:
+                logging.debug(f"Returning backup lines: {len(backup_lines)} lines found")
+                return backup_lines
 
         except Exception as e:
             logging.error(f"Line detection preprocessing failed: {e}")
@@ -1311,6 +1351,20 @@ class VideoProcessor:
 
                 # Try to display the window with error handling
                 try:
+                    # Check if we can create a display window (headless environment check)
+                    import os
+                    if os.environ.get('DISPLAY') is None and os.name != 'nt':
+                        logging.warning("No display available (headless environment), using text-based labeling")
+                        self._perform_text_hitl(cluster_ids)
+                        return
+
+                    # Try to create a test window first to check if display works
+                    test_img = np.zeros((100, 100, 3), dtype=np.uint8)
+                    cv2.imshow("Display Test", test_img)
+                    cv2.waitKey(1)
+                    cv2.destroyWindow("Display Test")
+
+                    # If test succeeds, show the actual window
                     cv2.imshow("Human-in-the-Loop: Label Teams", final_montage)
                     cv2.waitKey(100)  # Brief pause to ensure window is displayed
 
@@ -1326,8 +1380,13 @@ class VideoProcessor:
 
                     cv2.destroyAllWindows()  # More robust cleanup
 
-                except cv2.error as e:
+                except (cv2.error, Exception) as e:
                     logging.error(f"OpenCV display error: {e}")
+                    # Ensure windows are cleaned up even on error
+                    try:
+                        cv2.destroyAllWindows()
+                    except Exception:
+                        pass
                     # Fallback to text-based labeling
                     self._perform_text_hitl(cluster_ids)
                     return
@@ -1474,21 +1533,32 @@ class VideoProcessor:
                             logging.error(f"Team model fitting failed: {e}")
 
                 # Homography management with better error recovery
-                if self.homography_manager.homography_matrix is None:
-                    try:
-                        self.homography_manager.calculate_homography(frame)
-                    except Exception as e:
-                        logging.error(f"Homography calculation failed: {e}")
-                
-                # Periodically check homography quality
-                if actual_frame_id > 0 and actual_frame_id % self.config.HOMOGRAPHY_CHECK_INTERVAL == 0:
-                    try:
-                        error = self.homography_manager.calculate_reprojection_error()
-                        if error > self.config.HOMOGRAPHY_RECAL_THRESHOLD:
-                            logging.warning(f"High reprojection error ({error:.2f}px). Triggering recalibration.")
-                            self.homography_manager.homography_matrix = None
-                    except Exception as e:
-                        logging.warning(f"Homography error check failed: {e}")
+                if self.config.ENABLE_HOMOGRAPHY:
+                    # Only attempt calibration every few frames to reduce spam
+                    if (self.homography_manager.homography_matrix is None and
+                        actual_frame_id % 10 == 0):  # Try every 10th frame instead of every frame
+                        try:
+                            success = self.homography_manager.calculate_homography(frame)
+                            if success:
+                                logging.info(f"Homography successfully calibrated at frame {actual_frame_id}")
+                        except Exception as e:
+                            logging.error(f"Homography calculation failed: {e}")
+
+                    # Periodically check homography quality (less frequently)
+                    if (actual_frame_id > 0 and
+                        actual_frame_id % (self.config.HOMOGRAPHY_CHECK_INTERVAL * 2) == 0 and
+                        self.homography_manager.homography_matrix is not None):
+                        try:
+                            error = self.homography_manager.calculate_reprojection_error()
+                            if error > self.config.HOMOGRAPHY_RECAL_THRESHOLD:
+                                logging.warning(f"High reprojection error ({error:.2f}px). Triggering recalibration.")
+                                self.homography_manager.homography_matrix = None
+                        except Exception as e:
+                            logging.warning(f"Homography error check failed: {e}")
+                else:
+                    # Homography disabled - log once and ensure we use fallback
+                    if actual_frame_id == 1:
+                        logging.info("Homography calibration disabled in configuration - using fallback transformation")
 
                 # Classify team members
                 for obj in objects:

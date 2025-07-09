@@ -27,6 +27,9 @@ processing:
     action_sequence_length: 30
     processing_timeout: 1.0
     max_retries: 3
+    # Feature flags to prevent common errors
+    enable_hitl: true # Disable human-in-the-loop to prevent OpenCV display errors
+    enable_homography: true # Disable homography calibration to prevent calibration spam
 
 logging:
     level: 'INFO'
