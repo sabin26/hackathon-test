@@ -24,9 +24,9 @@ class TestConfig(unittest.TestCase):
         """Test configuration validation"""
         # Test missing video file
         config = Config()
-        config.MODEL_PARAMS['VIDEO_PATH'] = 0  # Use an int if that's the expected type, or change the key to the correct one for file path
+        config.VIDEO_PATH = 'nonexistent_video.mp4'  # Fixed: VIDEO_PATH is a class attribute, not in MODEL_PARAMS
         self.assertFalse(config.validate_config())
-        
+
         # Test invalid cluster count
         config.MODEL_PARAMS['TEAM_N_CLUSTERS'] = 1
         self.assertFalse(config.validate_config())
@@ -105,11 +105,11 @@ class TestSegmentationModel(unittest.TestCase):
     def test_invalid_frame(self):
         """Test handling of invalid frames"""
         model = SegmentationModel('nonexistent_model.pth')
-        
+
         # Empty frame
         empty_frame = np.array([])
         mask = model._placeholder_predict(empty_frame)
-        self.assertEqual(mask.shape, (0,))
+        self.assertEqual(mask.shape, (0, 0))  # Fixed: Should return (0, 0) shape for 2D array
 
 class TestObjectTracker(unittest.TestCase):
     def setUp(self):

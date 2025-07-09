@@ -293,6 +293,10 @@ class SegmentationModel:
     def _placeholder_predict(self, frame: np.ndarray) -> np.ndarray:
         """A more realistic placeholder that finds lines on the green parts of the pitch."""
         try:
+            # Check for invalid frame
+            if frame is None or frame.size == 0 or len(frame.shape) != 3:
+                return np.zeros((0, 0), dtype=np.uint8)
+
             hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
             
             # More robust green detection with multiple ranges
@@ -321,7 +325,11 @@ class SegmentationModel:
             
         except Exception as e:
             logging.error(f"Placeholder prediction failed: {e}")
-            return np.zeros(frame.shape[:2], dtype=np.uint8)
+            # Return appropriate empty array based on frame validity
+            if frame is not None and len(frame.shape) >= 2:
+                return np.zeros(frame.shape[:2], dtype=np.uint8)
+            else:
+                return np.zeros((0, 0), dtype=np.uint8)
 
 
 # --- 3. OBJECT TRACKER ---
@@ -552,10 +560,14 @@ class HomographyManager:
     def _find_pitch_corners(self, h_lines: List, v_lines: List) -> Optional[List]:
         """Find pitch corners with better error handling."""
         try:
+            # Check if we have enough lines
+            if len(h_lines) < 2 or len(v_lines) < 2:
+                return None
+
             # Sort lines by position
             h_lines.sort(key=lambda line: (line[0][1] + line[0][3]) / 2)
             v_lines.sort(key=lambda line: (line[0][0] + line[0][2]) / 2)
-            
+
             top_line = h_lines[0][0]
             bottom_line = h_lines[-1][0]
             left_line = v_lines[0][0]
@@ -655,8 +667,8 @@ class HomographyManager:
             
         try:
             for obj in tracked_objects:
-                x1, y1, x2, y2 = obj['bbox_video']
-                
+                x1, _, x2, y2 = obj['bbox_video']  # Fixed: Use underscore for unused y1 variable
+
                 # Use bottom center of bounding box
                 bottom_center = np.array([[(x1 + x2) / 2, y2]], dtype=np.float32)
                 
@@ -922,7 +934,7 @@ class VideoProcessor:
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
 
-    def _signal_handler(self, signum, frame):
+    def _signal_handler(self, signum, _):
         """Handle shutdown signals gracefully"""
         logging.info(f"Received signal {signum}, initiating graceful shutdown...")
         self.stop_event.set()
@@ -1104,11 +1116,12 @@ class VideoProcessor:
             cv2.destroyWindow("Human-in-the-Loop: Label Teams")
             
             labels = [label.strip() for label in user_input.split(',')]
-            if len(labels) == self.config.MODEL_PARAMS['TEAM_N_CLUSTERS']:
+            # Fixed: Check against actual number of clusters, not configured number
+            if len(labels) == len(cluster_ids):
                 self.team_identifier.team_map = {cluster_ids[i]: labels[i] for i in range(len(labels))}
                 logging.info(f"Team labels received and applied: {self.team_identifier.team_map}")
             else:
-                logging.error(f"Incorrect number of labels ({len(labels)} vs {self.config.MODEL_PARAMS['TEAM_N_CLUSTERS']}). Labeling aborted.")
+                logging.error(f"Incorrect number of labels ({len(labels)} vs {len(cluster_ids)} actual clusters). Labeling aborted.")
                 
         except Exception as e:
             logging.error(f"HITL process failed: {e}")
@@ -1474,10 +1487,11 @@ class VideoProcessor:
         except Exception as e:
             logging.error(f"Data export failed: {e}")
             # Try to restore backup if export failed
-            backup_files = [f for f in os.listdir('.') 
+            output_dir = os.path.dirname(self.config.OUTPUT_CSV_PATH) or '.'
+            backup_files = [f for f in os.listdir(output_dir)
                            if f.startswith(os.path.basename(self.config.OUTPUT_CSV_PATH) + '.backup_')]
             if backup_files:
-                latest_backup = max(backup_files)
+                latest_backup = os.path.join(output_dir, max(backup_files))
                 try:
                     os.rename(latest_backup, self.config.OUTPUT_CSV_PATH)
                     logging.info(f"Restored backup: {latest_backup}")
