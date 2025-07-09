@@ -71,6 +71,7 @@ class Config:
     MIN_VIDEO_RESOLUTION = (320, 240)
     MAX_VIDEO_RESOLUTION = (4096, 2160)
     SUPPORTED_VIDEO_FORMATS = ['.mp4', '.avi', '.mov', '.mkv']
+    ENABLE_HITL = True  # Set to False to disable human-in-the-loop labeling
     
     # Path generated dynamically based on video and parameter hashes
     checkpoint_path_prefix: Optional[str] = None
@@ -118,6 +119,7 @@ class Config:
                 cls.ACTION_SEQUENCE_LENGTH = proc.get('action_sequence_length', cls.ACTION_SEQUENCE_LENGTH)
                 cls.PROCESSING_TIMEOUT = proc.get('processing_timeout', cls.PROCESSING_TIMEOUT)
                 cls.MAX_RETRIES = proc.get('max_retries', cls.MAX_RETRIES)
+                cls.ENABLE_HITL = proc.get('enable_hitl', cls.ENABLE_HITL)
                 
             logging.info("Configuration loaded from YAML file")
             
@@ -385,14 +387,34 @@ class ObjectTracker:
                     # Ensure we have numpy arrays for iteration
                     def to_numpy(x):
                         if hasattr(x, 'cpu'):
-                            return x.cpu().numpy()
-                        return np.array(x)
-                    
+                            arr = x.cpu().numpy()
+                        else:
+                            arr = np.array(x)
+                        # Ensure array is at least 1D for iteration
+                        if arr.ndim == 0:
+                            arr = arr.reshape(1)
+                        return arr
+
                     xyxy = to_numpy(results[0].boxes.xyxy)
-                    ids = to_numpy(results[0].boxes.id)
+                    ids = to_numpy(results[0].boxes.id) if results[0].boxes.id is not None else np.array([])
                     clss = to_numpy(results[0].boxes.cls)
                     confs = to_numpy(results[0].boxes.conf)
-                    
+
+                    # Handle case where we have detections but no tracking IDs
+                    if len(ids) == 0 and len(xyxy) > 0:
+                        # Generate temporary IDs for detections without tracking
+                        ids = np.arange(len(xyxy)) + 10000  # Use high numbers to avoid conflicts
+
+                    # Ensure all arrays have the same length
+                    min_len = min(len(xyxy), len(ids), len(clss), len(confs))
+                    if min_len == 0:
+                        return objects
+
+                    xyxy = xyxy[:min_len]
+                    ids = ids[:min_len]
+                    clss = clss[:min_len]
+                    confs = confs[:min_len]
+
                     for box, track_id, cls_id, conf in zip(xyxy, ids, clss, confs):
                         if conf < 0.3:
                             continue
@@ -462,78 +484,131 @@ class HomographyManager:
         self.segmentation_model = segmentation_model
         self.homography_matrix = None
         self.template_points = np.array([
-            [0, 0], [pitch_dims[0], 0], 
+            [0, 0], [pitch_dims[0], 0],
             [pitch_dims[0], pitch_dims[1]], [0, pitch_dims[1]]
         ], dtype=np.float32)
         self.last_src_points = None
         self.calibration_attempts = 0
         self.max_calibration_attempts = 5
+        self.last_calibration_time = 0
+        self.calibration_cooldown = 30  # seconds between calibration resets
 
     def calculate_homography(self, frame: np.ndarray) -> bool:
         """Calculates homography using the segmentation mask with improved robustness."""
+        current_time = time.time()
+
+        # Reset calibration attempts after cooldown period
+        if current_time - self.last_calibration_time > self.calibration_cooldown:
+            self.calibration_attempts = 0
+            self.last_calibration_time = current_time
+
         if self.calibration_attempts >= self.max_calibration_attempts:
             logging.warning("Max calibration attempts reached")
             return False
-            
+
         self.calibration_attempts += 1
-        
+
         try:
+            # Validate input frame
+            if frame is None or frame.size == 0 or len(frame.shape) != 3:
+                logging.warning("Invalid frame for homography calculation")
+                return False
+
             line_mask = self.segmentation_model.predict(frame)
             if line_mask is None or line_mask.size == 0:
+                logging.debug("No line mask generated from segmentation")
                 return False
-                
+
             # Improved line detection with multiple parameter sets
             lines = self._detect_lines_robust(line_mask)
             if lines is None or len(lines) < 4:
+                logging.debug(f"Insufficient lines detected: {len(lines) if lines is not None else 0}")
                 return False
 
             # Separate horizontal and vertical lines with better angle thresholds
             h_lines, v_lines = self._separate_lines(lines)
-            
+
             if len(h_lines) < 2 or len(v_lines) < 2:
+                logging.debug(f"Insufficient line separation: h={len(h_lines)}, v={len(v_lines)}")
                 return False
 
             # Find pitch boundaries more robustly
             pitch_corners = self._find_pitch_corners(h_lines, v_lines)
             if pitch_corners is None:
+                logging.debug("Could not find valid pitch corners")
                 return False
 
             self.last_src_points = np.array(pitch_corners, dtype=np.float32)
-            self.homography_matrix, _ = cv2.findHomography(
-                self.last_src_points, 
-                self.template_points, 
-                cv2.RANSAC, 
-                5.0
+
+            # Validate corner points before homography calculation
+            if not self._validate_corner_points(self.last_src_points):
+                logging.debug("Corner points failed validation")
+                return False
+
+            self.homography_matrix, mask = cv2.findHomography(
+                self.last_src_points,
+                self.template_points,
+                cv2.RANSAC,
+                5.0,
+                maxIters=2000,
+                confidence=0.995
             )
-            
-            if self.homography_matrix is not None:
-                logging.info("Homography calibrated successfully.")
-                self.calibration_attempts = 0  # Reset on success
-                return True
-                
+
+            if self.homography_matrix is not None and mask is not None:
+                # Additional validation of homography quality
+                if self._validate_homography_matrix():
+                    logging.info("Homography calibrated successfully.")
+                    self.calibration_attempts = 0  # Reset on success
+                    return True
+                else:
+                    logging.debug("Homography matrix failed quality validation")
+                    self.homography_matrix = None
+
         except Exception as e:
             logging.error(f"Homography calculation failed: {e}")
-            
+
         return False
 
     def _detect_lines_robust(self, line_mask: np.ndarray) -> Optional[np.ndarray]:
         """Detect lines with multiple parameter sets for robustness."""
-        param_sets = [
-            (50, 50, 10),  # threshold, minLineLength, maxLineGap
-            (30, 30, 15),
-            (70, 70, 5)
-        ]
-        
-        for threshold, min_length, max_gap in param_sets:
-            lines = cv2.HoughLinesP(
-                line_mask, 1, np.pi / 180, 
-                threshold=threshold, 
-                minLineLength=min_length, 
-                maxLineGap=max_gap
-            )
-            if lines is not None and len(lines) >= 4:
-                return lines
-                
+        if line_mask is None or line_mask.size == 0:
+            return None
+
+        # Apply additional preprocessing to improve line detection
+        try:
+            # Dilate to connect broken lines
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+            line_mask = cv2.dilate(line_mask, kernel, iterations=1)
+
+            # Apply Gaussian blur to reduce noise
+            line_mask = cv2.GaussianBlur(line_mask, (3, 3), 0)
+
+            param_sets = [
+                (30, 30, 15),  # threshold, minLineLength, maxLineGap - more lenient first
+                (50, 50, 10),
+                (20, 20, 20),  # very lenient
+                (70, 70, 5),   # strict
+                (40, 25, 25)   # balanced
+            ]
+
+            for threshold, min_length, max_gap in param_sets:
+                try:
+                    lines = cv2.HoughLinesP(
+                        line_mask, 1, np.pi / 180,
+                        threshold=threshold,
+                        minLineLength=min_length,
+                        maxLineGap=max_gap
+                    )
+                    if lines is not None and len(lines) >= 4:
+                        logging.debug(f"Found {len(lines)} lines with params: {threshold}, {min_length}, {max_gap}")
+                        return lines
+                except cv2.error as e:
+                    logging.warning(f"HoughLinesP failed with params {threshold}, {min_length}, {max_gap}: {e}")
+                    continue
+
+        except Exception as e:
+            logging.error(f"Line detection preprocessing failed: {e}")
+
         return None
 
     def _separate_lines(self, lines: np.ndarray) -> Tuple[List, List]:
@@ -630,6 +705,60 @@ class HomographyManager:
         except Exception:
             return False
 
+    def _validate_corner_points(self, corners: np.ndarray) -> bool:
+        """Validate corner points for homography calculation."""
+        try:
+            if corners.shape != (4, 2):
+                return False
+
+            # Check if points are within reasonable bounds
+            for corner in corners:
+                if corner[0] < 0 or corner[1] < 0 or corner[0] > 4096 or corner[1] > 2160:
+                    return False
+
+            # Check if corners form a reasonable quadrilateral
+            area = cv2.contourArea(corners.astype(np.float32))
+            if area < 10000:  # Too small
+                return False
+
+            # Check if corners are not too close to each other
+            for i in range(4):
+                for j in range(i + 1, 4):
+                    dist = np.linalg.norm(corners[i] - corners[j])
+                    if dist < 50:  # Points too close
+                        return False
+
+            return True
+
+        except Exception:
+            return False
+
+    def _validate_homography_matrix(self) -> bool:
+        """Validate the quality of the homography matrix."""
+        try:
+            if self.homography_matrix is None:
+                return False
+
+            # Check if matrix is well-conditioned
+            cond_number = np.linalg.cond(self.homography_matrix)
+            if cond_number > 1e10:  # Poorly conditioned matrix
+                return False
+
+            # Check determinant to ensure it's not degenerate
+            det = np.linalg.det(self.homography_matrix[:2, :2])
+            if abs(det) < 1e-6:
+                return False
+
+            # Check reprojection error
+            error = self.calculate_reprojection_error()
+            if error > 50.0:  # Too high error
+                return False
+
+            return True
+
+        except Exception:
+            return False
+
     def calculate_reprojection_error(self) -> float:
         """Calculates the true reprojection error to monitor homography quality."""
         if self.homography_matrix is None or self.last_src_points is None:
@@ -663,25 +792,55 @@ class HomographyManager:
     def apply_homography(self, tracked_objects: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Transforms object coordinates from video space to pitch space."""
         if self.homography_matrix is None:
-            return tracked_objects
-            
+            # Fallback: use simple scaling transformation
+            return self._apply_fallback_transformation(tracked_objects)
+
         try:
             for obj in tracked_objects:
                 x1, _, x2, y2 = obj['bbox_video']  # Fixed: Use underscore for unused y1 variable
 
                 # Use bottom center of bounding box
                 bottom_center = np.array([[(x1 + x2) / 2, y2]], dtype=np.float32)
-                
+
                 transformed_point = cv2.perspectiveTransform(
-                    bottom_center.reshape(-1, 1, 2), 
+                    bottom_center.reshape(-1, 1, 2),
                     self.homography_matrix
                 )
-                
+
                 obj['pos_pitch'] = transformed_point.flatten().tolist()
-                
+
         except Exception as e:
             logging.error(f"Homography application failed: {e}")
-            
+            # Fallback to simple transformation
+            return self._apply_fallback_transformation(tracked_objects)
+
+        return tracked_objects
+
+    def _apply_fallback_transformation(self, tracked_objects: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Apply a simple scaling transformation when homography is not available."""
+        try:
+            # Assume a typical video resolution and scale to pitch dimensions
+            video_width, video_height = 1920, 1080  # Default assumption
+            pitch_width, pitch_height = self.pitch_dims
+
+            for obj in tracked_objects:
+                x1, _, x2, y2 = obj['bbox_video']
+
+                # Use bottom center of bounding box
+                center_x = (x1 + x2) / 2
+
+                # Simple linear scaling
+                pitch_x = (center_x / video_width) * pitch_width
+                pitch_y = (y2 / video_height) * pitch_height
+
+                obj['pos_pitch'] = [float(pitch_x), float(pitch_y)]
+
+        except Exception as e:
+            logging.error(f"Fallback transformation failed: {e}")
+            # Set default positions
+            for obj in tracked_objects:
+                obj['pos_pitch'] = [0.0, 0.0]
+
         return tracked_objects
 
 
@@ -1059,72 +1218,186 @@ class VideoProcessor:
         """A superior HITL experience with a visual montage."""
         try:
             logging.warning("PAUSING FOR HUMAN INPUT: Please label the teams in the popup window.")
-            
+
             montages = []
             cluster_ids = sorted(self.team_identifier.example_crops.keys())
-            
+
+            if not cluster_ids:
+                logging.error("No clusters found for HITL labeling.")
+                return
+
             for cluster_id in cluster_ids:
                 crops = self.team_identifier.example_crops[cluster_id]
                 if not crops:
                     continue
-                
-                # Create a grid of crops instead of a single row
-                grid_size = min(len(crops), 10)
-                rows = []
-                
-                for i in range(0, grid_size, 5):
-                    row_crops = crops[i:i+5]
-                    if len(row_crops) > 0:
-                        row = cv2.hconcat(row_crops)
-                        rows.append(row)
-                
-                if rows:
-                    crop_grid = cv2.vconcat(rows)
-                    
-                    # Add label
-                    label_img = np.zeros((40, crop_grid.shape[1], 3), dtype=np.uint8)
-                    cv2.putText(label_img, f"Cluster {cluster_id}", (10, 25), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-                    
-                    montages.append(cv2.vconcat([label_img, crop_grid]))
-            
+
+                try:
+                    # Validate crops before processing
+                    valid_crops = []
+                    for crop in crops[:10]:  # Limit to 10 crops
+                        if crop is not None and crop.size > 0 and len(crop.shape) == 3:
+                            # Ensure crop has valid dimensions
+                            if crop.shape[0] > 0 and crop.shape[1] > 0:
+                                valid_crops.append(crop)
+
+                    if not valid_crops:
+                        continue
+
+                    # Create a grid of crops with better error handling
+                    rows = []
+                    for i in range(0, len(valid_crops), 5):
+                        row_crops = valid_crops[i:i+5]
+                        if len(row_crops) > 0:
+                            try:
+                                # Ensure all crops in row have same height
+                                max_height = max(crop.shape[0] for crop in row_crops)
+                                resized_crops = []
+                                for crop in row_crops:
+                                    if crop.shape[0] != max_height:
+                                        crop = cv2.resize(crop, (crop.shape[1], max_height))
+                                    resized_crops.append(crop)
+
+                                row = cv2.hconcat(resized_crops)
+                                rows.append(row)
+                            except cv2.error as e:
+                                logging.warning(f"Failed to create crop row: {e}")
+                                continue
+
+                    if rows:
+                        try:
+                            # Ensure all rows have same width
+                            max_width = max(row.shape[1] for row in rows)
+                            resized_rows = []
+                            for row in rows:
+                                if row.shape[1] != max_width:
+                                    row = cv2.resize(row, (max_width, row.shape[0]))
+                                resized_rows.append(row)
+
+                            crop_grid = cv2.vconcat(resized_rows)
+
+                            # Add label with error handling
+                            try:
+                                label_img = np.zeros((40, crop_grid.shape[1], 3), dtype=np.uint8)
+                                cv2.putText(label_img, f"Cluster {cluster_id}", (10, 25),
+                                           cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+
+                                montages.append(cv2.vconcat([label_img, crop_grid]))
+                            except cv2.error as e:
+                                logging.warning(f"Failed to add label to crop grid: {e}")
+                                montages.append(crop_grid)
+
+                        except cv2.error as e:
+                            logging.warning(f"Failed to create crop grid: {e}")
+                            continue
+
+                except Exception as e:
+                    logging.warning(f"Failed to process crops for cluster {cluster_id}: {e}")
+                    continue
+
             if not montages:
-                logging.error("Could not generate HITL montage: no example crops were collected.")
+                logging.error("Could not generate HITL montage: no valid example crops were collected.")
+                # Fallback to text-based labeling
+                self._perform_text_hitl(cluster_ids)
                 return
 
-            final_montage = cv2.vconcat(montages)
-            
-            # Resize if too large
-            if final_montage.shape[0] > 800:
-                scale = 800 / final_montage.shape[0]
-                new_width = int(final_montage.shape[1] * scale)
-                final_montage = cv2.resize(final_montage, (new_width, 800))
-            
-            cv2.imshow("Human-in-the-Loop: Label Teams", final_montage)
-            cv2.waitKey(100)  # Brief pause to ensure window is displayed
-            
-            print("\n" + "="*60)
-            print("ACTION REQUIRED: A window named 'Human-in-the-Loop' has opened.")
-            print("Based on the image, please provide labels for the clusters.")
-            print("Press any key in the image window after reading, then provide labels.")
-            
-            cv2.waitKey(0)  # Wait for key press
-            
-            user_input = input(f"Enter {self.config.MODEL_PARAMS['TEAM_N_CLUSTERS']} comma-separated labels (e.g., Team A,Team B,Referee): ")
-            print("="*60 + "\n")
+            try:
+                final_montage = cv2.vconcat(montages)
 
-            cv2.destroyWindow("Human-in-the-Loop: Label Teams")
-            
+                # Resize if too large
+                if final_montage.shape[0] > 800:
+                    scale = 800 / final_montage.shape[0]
+                    new_width = int(final_montage.shape[1] * scale)
+                    final_montage = cv2.resize(final_montage, (new_width, 800))
+
+                # Try to display the window with error handling
+                try:
+                    cv2.imshow("Human-in-the-Loop: Label Teams", final_montage)
+                    cv2.waitKey(100)  # Brief pause to ensure window is displayed
+
+                    print("\n" + "="*60)
+                    print("ACTION REQUIRED: A window named 'Human-in-the-Loop' has opened.")
+                    print("Based on the image, please provide labels for the clusters.")
+                    print("Press any key in the image window after reading, then provide labels.")
+
+                    cv2.waitKey(0)  # Wait for key press
+
+                    user_input = input(f"Enter {len(cluster_ids)} comma-separated labels (e.g., Team A,Team B,Referee): ")
+                    print("="*60 + "\n")
+
+                    cv2.destroyAllWindows()  # More robust cleanup
+
+                except cv2.error as e:
+                    logging.error(f"OpenCV display error: {e}")
+                    # Fallback to text-based labeling
+                    self._perform_text_hitl(cluster_ids)
+                    return
+
+            except cv2.error as e:
+                logging.error(f"Failed to create final montage: {e}")
+                # Fallback to text-based labeling
+                self._perform_text_hitl(cluster_ids)
+                return
+
             labels = [label.strip() for label in user_input.split(',')]
-            # Fixed: Check against actual number of clusters, not configured number
             if len(labels) == len(cluster_ids):
                 self.team_identifier.team_map = {cluster_ids[i]: labels[i] for i in range(len(labels))}
                 logging.info(f"Team labels received and applied: {self.team_identifier.team_map}")
             else:
                 logging.error(f"Incorrect number of labels ({len(labels)} vs {len(cluster_ids)} actual clusters). Labeling aborted.")
-                
+
         except Exception as e:
             logging.error(f"HITL process failed: {e}")
+            # Fallback to text-based labeling
+            cluster_ids = sorted(self.team_identifier.example_crops.keys())
+            if cluster_ids:
+                self._perform_text_hitl(cluster_ids)
+
+    def _perform_text_hitl(self, cluster_ids: List[int]) -> None:
+        """Fallback text-based HITL when visual display fails."""
+        try:
+            print("\n" + "="*60)
+            print("FALLBACK MODE: Visual display failed, using text-based labeling.")
+            print(f"Found {len(cluster_ids)} clusters: {cluster_ids}")
+            print("Please provide labels for each cluster.")
+
+            # Check if we're in an interactive environment
+            import sys
+            if not sys.stdin.isatty():
+                # Non-interactive mode - use default labels
+                logging.warning("Non-interactive environment detected. Using default team labels.")
+                default_labels = [f"Team_{i}" for i in range(len(cluster_ids))]
+                self.team_identifier.team_map = {cluster_ids[i]: default_labels[i] for i in range(len(cluster_ids))}
+                logging.info(f"Default team labels applied: {self.team_identifier.team_map}")
+                return
+
+            try:
+                user_input = input(f"Enter {len(cluster_ids)} comma-separated labels (e.g., Team A,Team B,Referee): ")
+                print("="*60 + "\n")
+
+                labels = [label.strip() for label in user_input.split(',')]
+                if len(labels) == len(cluster_ids):
+                    self.team_identifier.team_map = {cluster_ids[i]: labels[i] for i in range(len(labels))}
+                    logging.info(f"Team labels received and applied: {self.team_identifier.team_map}")
+                else:
+                    logging.error(f"Incorrect number of labels ({len(labels)} vs {len(cluster_ids)} actual clusters). Using defaults.")
+                    self._use_default_labels(cluster_ids)
+
+            except (EOFError, KeyboardInterrupt):
+                logging.warning("User input interrupted. Using default labels.")
+                self._use_default_labels(cluster_ids)
+
+        except Exception as e:
+            logging.error(f"Text-based HITL failed: {e}. Using default labels.")
+            self._use_default_labels(cluster_ids)
+
+    def _use_default_labels(self, cluster_ids: List[int]) -> None:
+        """Use default labels when user input fails."""
+        try:
+            default_labels = [f"Team_{i}" for i in range(len(cluster_ids))]
+            self.team_identifier.team_map = {cluster_ids[i]: default_labels[i] for i in range(len(cluster_ids))}
+            logging.info(f"Default team labels applied: {self.team_identifier.team_map}")
+        except Exception as e:
+            logging.error(f"Failed to apply default labels: {e}")
 
     def _processing_loop(self) -> None:
         """Enhanced processing loop with frame skipping and better error handling"""
@@ -1188,9 +1461,15 @@ class VideoProcessor:
                         try:
                             self.team_identifier.fit()
                             
-                            # Perform HITL if needed
+                            # Perform HITL if needed and enabled
                             if not self.team_identifier.team_map:
-                                self._perform_visual_hitl()
+                                if self.config.ENABLE_HITL:
+                                    self._perform_visual_hitl()
+                                else:
+                                    # Use default labels when HITL is disabled
+                                    cluster_ids = sorted(self.team_identifier.example_crops.keys())
+                                    if cluster_ids:
+                                        self._use_default_labels(cluster_ids)
                         except Exception as e:
                             logging.error(f"Team model fitting failed: {e}")
 
