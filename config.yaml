@@ -1,0 +1,41 @@
+# Sports Analytics Configuration File
+video:
+    path: 'sample_video.mp4'
+    supported_formats: ['.mp4', '.avi', '.mov', '.mkv']
+    min_resolution: [320, 240]
+    max_resolution: [4096, 2160]
+
+output:
+    csv_path: 'enterprise_analytics_output.csv'
+    checkpoint_dir: './analyzer_checkpoints'
+    log_file: 'sports_analytics.log'
+
+models:
+    yolo_path: 'yolov8n.pt'
+    segmentation_path: 'path/to/your/segmentation_model.pth'
+
+processing:
+    team_n_clusters: 3
+    team_feature_bins: 16
+    min_crop_size: 100
+    max_crops_per_cluster: 15
+    frame_skip_interval: 2
+    max_processing_queue_size: 32
+    team_samples_to_collect: 300
+    homography_recal_threshold: 3.0
+    homography_check_interval: 150
+    action_sequence_length: 30
+    processing_timeout: 1.0
+    max_retries: 3
+
+logging:
+    level: 'INFO'
+    format: '%(asctime)s - %(levelname)s - [%(threadName)s] - %(message)s'
+    max_file_size_mb: 10
+    backup_count: 5
+
+performance:
+    memory_warning_threshold: 85
+    slow_frame_threshold: 1.0
+    metrics_log_interval: 30
+    enable_profiling: false
