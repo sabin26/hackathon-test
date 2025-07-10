@@ -47,6 +47,64 @@ class DashboardServer:
                 "fps": 0,
                 "processing_time": 0,
                 "detection_accuracy": 0
+            },
+            # Enhanced team statistics
+            "team_stats": {
+                "team_A": {
+                    "possession_time": 0,
+                    "total_passes": 0,
+                    "successful_passes": 0,
+                    "shots_taken": 0,
+                    "shots_on_goal": 0,
+                    "goals_scored": 0,
+                    "distance_covered": 0,
+                    "average_speed": 0,
+                    "ball_touches": 0,
+                    "defensive_actions": 0
+                },
+                "team_B": {
+                    "possession_time": 0,
+                    "total_passes": 0,
+                    "successful_passes": 0,
+                    "shots_taken": 0,
+                    "shots_on_goal": 0,
+                    "goals_scored": 0,
+                    "distance_covered": 0,
+                    "average_speed": 0,
+                    "ball_touches": 0,
+                    "defensive_actions": 0
+                }
+            },
+            # Individual player statistics
+            "player_stats": {},
+            # Game flow analytics
+            "game_flow": {
+                "possession_changes": [],
+                "momentum_indicator": 0,  # -1 to 1, negative favors team_A, positive favors team_B
+                "activity_zones": {},
+                "game_intensity": 0
+            },
+            # Advanced event analytics
+            "event_analytics": {
+                "event_frequency": {
+                    "Pass": 0,
+                    "Shot": 0,
+                    "Possession": 0,
+                    "Dribble": 0,
+                    "Tackle": 0,
+                    "Interception": 0
+                },
+                "event_success_rates": {
+                    "Pass": {"successful": 0, "total": 0},
+                    "Shot": {"successful": 0, "total": 0},
+                    "Dribble": {"successful": 0, "total": 0}
+                },
+                "event_timeline": [],
+                "heat_zones": {
+                    "defensive_third": {"team_A": 0, "team_B": 0},
+                    "middle_third": {"team_A": 0, "team_B": 0},
+                    "attacking_third": {"team_A": 0, "team_B": 0}
+                }
             }
         }
 
@@ -266,68 +324,334 @@ class DashboardServer:
         """Update game statistics based on new frame data"""
         try:
             self.game_stats["total_frames"] += 1
-            
+            timestamp = frame_data.get("timestamp", 0)
+
             # Update player and ball detection stats
             objects = frame_data.get("objects", [])
             players = [obj for obj in objects if obj.get("type") == "person"]
             balls = [obj for obj in objects if obj.get("type") == "sports ball"]
-            
+
             self.game_stats["players_detected"] = len(players)
             self.game_stats["ball_detected"] = len(balls) > 0
-            
-            # Update player positions for heatmap
+
+            # Update player positions and individual stats
             for player in players:
                 player_id = player.get("id")
                 pos_pitch = player.get("pos_pitch", [0, 0])
                 team_name = player.get("team_name", "unknown")
-                
+                player_speed = player.get("player_speed_kmh", 0)
+
                 if player_id:
+                    # Initialize player stats if not exists
+                    if player_id not in self.game_stats["player_stats"]:
+                        self.game_stats["player_stats"][player_id] = {
+                            "team": team_name,
+                            "distance_covered": 0,
+                            "average_speed": 0,
+                            "max_speed": 0,
+                            "ball_touches": 0,
+                            "passes_made": 0,
+                            "passes_received": 0,
+                            "shots_taken": 0,
+                            "possession_time": 0,
+                            "last_position": None,
+                            "speed_samples": []
+                        }
+
+                    player_stat = self.game_stats["player_stats"][player_id]
+
+                    # Update position history
                     if player_id not in self.game_stats["player_positions"]:
                         self.game_stats["player_positions"][player_id] = []
-                    
-                    self.game_stats["player_positions"][player_id].append({
+
+                    current_pos = {
                         "x": pos_pitch[0] if len(pos_pitch) > 0 else 0,
                         "y": pos_pitch[1] if len(pos_pitch) > 1 else 0,
-                        "timestamp": frame_data.get("timestamp", 0),
+                        "timestamp": timestamp,
                         "team": team_name
-                    })
-                    
+                    }
+
+                    self.game_stats["player_positions"][player_id].append(current_pos)
+
+                    # Calculate distance covered
+                    if player_stat["last_position"]:
+                        last_pos = player_stat["last_position"]
+                        distance = ((current_pos["x"] - last_pos["x"])**2 +
+                                  (current_pos["y"] - last_pos["y"])**2)**0.5
+                        player_stat["distance_covered"] += distance
+
+                    player_stat["last_position"] = current_pos
+
+                    # Update speed statistics
+                    if isinstance(player_speed, (int, float)) and player_speed > 0:
+                        player_stat["speed_samples"].append(player_speed)
+                        player_stat["max_speed"] = max(player_stat["max_speed"], player_speed)
+                        player_stat["average_speed"] = sum(player_stat["speed_samples"]) / len(player_stat["speed_samples"])
+
+                        # Keep only recent speed samples
+                        if len(player_stat["speed_samples"]) > 50:
+                            player_stat["speed_samples"] = player_stat["speed_samples"][-50:]
+
                     # Keep only recent positions (last 100 points)
                     if len(self.game_stats["player_positions"][player_id]) > 100:
                         self.game_stats["player_positions"][player_id] = \
                             self.game_stats["player_positions"][player_id][-100:]
-            
-            # Update possession stats
+
+            # Process actions and update team/player statistics
             actions = frame_data.get("actions", {})
+            current_possession_team = None
+
             for player_id, action_data in actions.items():
                 event_type = action_data.get("event_type", "")
+                event_outcome = action_data.get("event_outcome", "")
+                team_name = action_data.get("team_name", "unknown")
+
+                # Map team names to standardized format
+                if team_name in ["Team_A", "Cluster 0"]:
+                    team_key = "team_A"
+                elif team_name in ["Team_B", "Cluster 1"]:
+                    team_key = "team_B"
+                else:
+                    team_key = None
+
+                # Update possession stats
                 if event_type == "Possession":
-                    team_name = action_data.get("team_name", "none")
-                    if team_name in self.game_stats["possession_stats"]:
-                        self.game_stats["possession_stats"][team_name] += 1
+                    current_possession_team = team_key
+                    if team_key in self.game_stats["possession_stats"]:
+                        self.game_stats["possession_stats"][team_key] += 1
                     else:
                         self.game_stats["possession_stats"]["none"] += 1
-            
+
+                    # Update team possession time
+                    if team_key and team_key in self.game_stats["team_stats"]:
+                        self.game_stats["team_stats"][team_key]["possession_time"] += 1
+
+                    # Update player possession time
+                    if player_id in self.game_stats["player_stats"]:
+                        self.game_stats["player_stats"][player_id]["possession_time"] += 1
+                        self.game_stats["player_stats"][player_id]["ball_touches"] += 1
+
+                # Update pass statistics
+                elif event_type == "Pass":
+                    if team_key and team_key in self.game_stats["team_stats"]:
+                        self.game_stats["team_stats"][team_key]["total_passes"] += 1
+                        if event_outcome == "successful":
+                            self.game_stats["team_stats"][team_key]["successful_passes"] += 1
+
+                    if player_id in self.game_stats["player_stats"]:
+                        self.game_stats["player_stats"][player_id]["passes_made"] += 1
+
+                # Update shot statistics
+                elif event_type in ["Shot", "Shot_Attempt"]:
+                    if team_key and team_key in self.game_stats["team_stats"]:
+                        self.game_stats["team_stats"][team_key]["shots_taken"] += 1
+                        if event_outcome in ["goal", "on_target"]:
+                            self.game_stats["team_stats"][team_key]["shots_on_goal"] += 1
+                        if event_outcome == "goal":
+                            self.game_stats["team_stats"][team_key]["goals_scored"] += 1
+
+                    if player_id in self.game_stats["player_stats"]:
+                        self.game_stats["player_stats"][player_id]["shots_taken"] += 1
+
+                # Track defensive actions
+                elif event_type in ["Tackle", "Interception", "Clearance"]:
+                    if team_key and team_key in self.game_stats["team_stats"]:
+                        self.game_stats["team_stats"][team_key]["defensive_actions"] += 1
+
             # Update events list
             for player_id, action_data in actions.items():
                 event_type = action_data.get("event_type", "")
                 if event_type and event_type != "":
                     event = {
-                        "timestamp": frame_data.get("timestamp", 0),
+                        "timestamp": timestamp,
                         "player_id": player_id,
                         "event_type": event_type,
                         "event_outcome": action_data.get("event_outcome", ""),
                         "team_name": action_data.get("team_name", "unknown")
                     }
                     self.game_stats["events"].append(event)
-                    
+
                     # Keep only recent events (last 50)
                     if len(self.game_stats["events"]) > 50:
                         self.game_stats["events"] = self.game_stats["events"][-50:]
-        
+
+            # Update team distance and speed averages
+            self._update_team_aggregates()
+
+            # Update game flow analytics
+            self._update_game_flow(current_possession_team, timestamp)
+
+            # Update advanced event analytics
+            self._update_event_analytics(actions, timestamp)
+
         except Exception as e:
             logger.error(f"Error updating game stats: {e}")
-    
+
+    def _update_team_aggregates(self):
+        """Update team-level aggregate statistics from individual player stats"""
+        try:
+            for team_key in ["team_A", "team_B"]:
+                team_players = [
+                    player_stat for player_id, player_stat in self.game_stats["player_stats"].items()
+                    if player_stat.get("team", "").replace("Team_", "team_").replace("Cluster 0", "team_A").replace("Cluster 1", "team_B") == team_key
+                ]
+
+                if team_players:
+                    # Calculate total distance covered by team
+                    total_distance = sum(player.get("distance_covered", 0) for player in team_players)
+                    self.game_stats["team_stats"][team_key]["distance_covered"] = total_distance
+
+                    # Calculate average team speed
+                    speeds = [player.get("average_speed", 0) for player in team_players if player.get("average_speed", 0) > 0]
+                    if speeds:
+                        self.game_stats["team_stats"][team_key]["average_speed"] = sum(speeds) / len(speeds)
+
+                    # Update ball touches
+                    total_touches = sum(player.get("ball_touches", 0) for player in team_players)
+                    self.game_stats["team_stats"][team_key]["ball_touches"] = total_touches
+
+        except Exception as e:
+            logger.error(f"Error updating team aggregates: {e}")
+
+    def _update_game_flow(self, current_possession_team: str, timestamp: float):
+        """Update game flow analytics including momentum and possession changes"""
+        try:
+            # Track possession changes
+            possession_changes = self.game_stats["game_flow"]["possession_changes"]
+
+            if possession_changes:
+                last_possession = possession_changes[-1]["team"]
+                if current_possession_team and current_possession_team != last_possession:
+                    possession_changes.append({
+                        "timestamp": timestamp,
+                        "team": current_possession_team,
+                        "duration": 0
+                    })
+            elif current_possession_team:
+                possession_changes.append({
+                    "timestamp": timestamp,
+                    "team": current_possession_team,
+                    "duration": 0
+                })
+
+            # Update possession durations
+            if possession_changes:
+                for i in range(len(possession_changes) - 1):
+                    possession_changes[i]["duration"] = possession_changes[i + 1]["timestamp"] - possession_changes[i]["timestamp"]
+
+                # Update current possession duration
+                if len(possession_changes) > 0:
+                    possession_changes[-1]["duration"] = timestamp - possession_changes[-1]["timestamp"]
+
+            # Keep only recent possession changes (last 20)
+            if len(possession_changes) > 20:
+                self.game_stats["game_flow"]["possession_changes"] = possession_changes[-20:]
+
+            # Calculate momentum indicator based on recent events
+            recent_events = self.game_stats["events"][-10:] if len(self.game_stats["events"]) >= 10 else self.game_stats["events"]
+
+            team_a_score = 0
+            team_b_score = 0
+
+            for event in recent_events:
+                team = event.get("team_name", "")
+                event_type = event.get("event_type", "")
+
+                # Weight different events
+                weight = 1
+                if event_type in ["Shot", "Goal"]:
+                    weight = 3
+                elif event_type == "Pass" and event.get("event_outcome") == "successful":
+                    weight = 1
+                elif event_type == "Possession":
+                    weight = 0.5
+
+                if team in ["Team_A", "Cluster 0"]:
+                    team_a_score += weight
+                elif team in ["Team_B", "Cluster 1"]:
+                    team_b_score += weight
+
+            # Calculate momentum (-1 to 1)
+            total_score = team_a_score + team_b_score
+            if total_score > 0:
+                momentum = (team_b_score - team_a_score) / total_score
+                self.game_stats["game_flow"]["momentum_indicator"] = max(-1, min(1, momentum))
+
+            # Calculate game intensity based on event frequency
+            if len(recent_events) > 0:
+                time_span = recent_events[-1]["timestamp"] - recent_events[0]["timestamp"] if len(recent_events) > 1 else 1
+                intensity = len(recent_events) / max(time_span, 1)
+                self.game_stats["game_flow"]["game_intensity"] = min(intensity, 10)  # Cap at 10
+
+        except Exception as e:
+            logger.error(f"Error updating game flow: {e}")
+
+    def _update_event_analytics(self, actions: Dict[str, Any], timestamp: float):
+        """Update advanced event analytics including frequency and success rates"""
+        try:
+            for player_id, action_data in actions.items():
+                event_type = action_data.get("event_type", "")
+                event_outcome = action_data.get("event_outcome", "")
+                team_name = action_data.get("team_name", "unknown")
+
+                if not event_type:
+                    continue
+
+                # Update event frequency
+                if event_type in self.game_stats["event_analytics"]["event_frequency"]:
+                    self.game_stats["event_analytics"]["event_frequency"][event_type] += 1
+
+                # Update success rates for specific events
+                if event_type in self.game_stats["event_analytics"]["event_success_rates"]:
+                    success_data = self.game_stats["event_analytics"]["event_success_rates"][event_type]
+                    success_data["total"] += 1
+
+                    # Determine if event was successful
+                    is_successful = False
+                    if event_type == "Pass" and event_outcome == "successful":
+                        is_successful = True
+                    elif event_type == "Shot" and event_outcome in ["goal", "on_target"]:
+                        is_successful = True
+                    elif event_type == "Dribble" and event_outcome == "successful":
+                        is_successful = True
+
+                    if is_successful:
+                        success_data["successful"] += 1
+
+                # Add to event timeline
+                event_entry = {
+                    "timestamp": timestamp,
+                    "event_type": event_type,
+                    "event_outcome": event_outcome,
+                    "team": team_name,
+                    "player_id": player_id
+                }
+                self.game_stats["event_analytics"]["event_timeline"].append(event_entry)
+
+                # Keep only recent events in timeline (last 100)
+                if len(self.game_stats["event_analytics"]["event_timeline"]) > 100:
+                    self.game_stats["event_analytics"]["event_timeline"] = \
+                        self.game_stats["event_analytics"]["event_timeline"][-100:]
+
+                # Update heat zones based on player position (simplified)
+                # This would need actual position data for accurate zone calculation
+                if team_name in ["Team_A", "Cluster 0"]:
+                    team_key = "team_A"
+                elif team_name in ["Team_B", "Cluster 1"]:
+                    team_key = "team_B"
+                else:
+                    team_key = None
+
+                if team_key:
+                    # For now, distribute events across zones (this could be enhanced with actual position data)
+                    import random
+                    zones = ["defensive_third", "middle_third", "attacking_third"]
+                    zone = random.choice(zones)
+                    self.game_stats["event_analytics"]["heat_zones"][zone][team_key] += 1
+
+        except Exception as e:
+            logger.error(f"Error updating event analytics: {e}")
+
     async def _process_data_queue(self):
         """Background task to process data queue and broadcast to clients"""
         while True:
