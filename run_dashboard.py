@@ -9,11 +9,6 @@ to provide real-time sports analytics visualization.
 import os
 import warnings
 
-# Set environment variables and suppress warnings before importing any ML libraries
-os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
-warnings.filterwarnings("ignore", message=".*pin_memory.*not supported on MPS.*")
-warnings.filterwarnings("ignore", category=UserWarning, module="torch.utils.data.dataloader")
-
 import asyncio
 import logging
 import threading
@@ -23,6 +18,11 @@ import sys
 # Import our modules
 from ai import Config, VideoProcessor
 from dashboard_server import DashboardServer
+
+# Set environment variables and suppress warnings before importing any ML libraries
+os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
+warnings.filterwarnings("ignore", message=".*pin_memory.*not supported on MPS.*")
+warnings.filterwarnings("ignore", category=UserWarning, module="torch.utils.data.dataloader")
 
 # Configure logging
 logging.basicConfig(
