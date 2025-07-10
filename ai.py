@@ -66,6 +66,7 @@ class Config:
     YOLO_MODEL_PATH = 'yolov8n.pt'
     SEGMENTATION_MODEL_PATH = 'path/to/your/segmentation_model.pth'
     JERSEY_YOLO_MODEL_PATH = None  # Path to custom YOLO model trained for jersey number detection
+    TEAM_ROSTER_PATH = None  # Path to CSV file with team rosters (team_name, jersey_number, player_name)
     TEAM_SAMPLES_TO_COLLECT = 300
     HOMOGRAPHY_RECAL_THRESHOLD = 3.0
     HOMOGRAPHY_CHECK_INTERVAL = 150
@@ -112,6 +113,7 @@ class Config:
                 cls.YOLO_MODEL_PATH = config_data['models'].get('yolo_path', cls.YOLO_MODEL_PATH)
                 cls.SEGMENTATION_MODEL_PATH = config_data['models'].get('segmentation_path', cls.SEGMENTATION_MODEL_PATH)
                 cls.JERSEY_YOLO_MODEL_PATH = config_data['models'].get('jersey_yolo_path', cls.JERSEY_YOLO_MODEL_PATH)
+                cls.TEAM_ROSTER_PATH = config_data['models'].get('team_roster_path', cls.TEAM_ROSTER_PATH)
             
             # Update processing parameters
             if 'processing' in config_data:
@@ -1272,7 +1274,258 @@ class JerseyNumberDetector:
         self.jersey_cache.clear()
 
 
-# --- 5.2. GEMINI TEAM IDENTIFIER ---
+# --- 5.2. COMPREHENSIVE PLAYER DATABASE ---
+class PlayerDatabase:
+    """
+    Comprehensive player identification system that combines jersey detection,
+    team identification, and player naming for accurate sports analytics.
+    """
+
+    def __init__(self, jersey_detector: 'JerseyNumberDetector', team_identifier: 'TeamIdentifier'):
+        self.jersey_detector = jersey_detector
+        self.team_identifier = team_identifier
+        self.player_registry = {}  # object_id -> PlayerInfo
+        self.team_rosters = {}     # team_name -> {jersey_number -> player_name}
+        self.jersey_to_player = {} # team_name -> {jersey_number -> player_name}
+        self._lock = threading.Lock()
+
+        # Load known player databases (could be from external sources)
+        self._load_player_databases()
+
+    @dataclass
+    class PlayerInfo:
+        """Complete player information"""
+        object_id: int
+        jersey_number: int
+        team_name: str
+        player_name: str
+        confidence_score: float
+        detection_count: int
+        last_seen_frame: int
+
+        def update_confidence(self, new_detection: bool):
+            """Update confidence based on consistent detections"""
+            if new_detection:
+                self.detection_count += 1
+                self.confidence_score = min(1.0, self.confidence_score + 0.1)
+            else:
+                self.confidence_score = max(0.0, self.confidence_score - 0.05)
+
+    def _load_player_databases(self):
+        """Load known player databases from external sources"""
+        try:
+            # This could load from:
+            # 1. CSV files with team rosters
+            # 2. Sports APIs
+            # 3. Manual configuration files
+            # 4. Previous game databases
+
+            # Example team rosters (in practice, load from external sources)
+            self.team_rosters = {
+                'Team_A': {
+                    1: 'Goalkeeper_A',
+                    2: 'Defender_A_1',
+                    3: 'Defender_A_2',
+                    4: 'Defender_A_3',
+                    5: 'Defender_A_4',
+                    6: 'Midfielder_A_1',
+                    7: 'Midfielder_A_2',
+                    8: 'Midfielder_A_3',
+                    9: 'Forward_A_1',
+                    10: 'Forward_A_2',
+                    11: 'Forward_A_3'
+                },
+                'Team_B': {
+                    1: 'Goalkeeper_B',
+                    2: 'Defender_B_1',
+                    3: 'Defender_B_2',
+                    4: 'Defender_B_3',
+                    5: 'Defender_B_4',
+                    6: 'Midfielder_B_1',
+                    7: 'Midfielder_B_2',
+                    8: 'Midfielder_B_3',
+                    9: 'Forward_B_1',
+                    10: 'Forward_B_2',
+                    11: 'Forward_B_3'
+                }
+            }
+
+            # Create reverse mapping for quick lookup
+            for team_name, roster in self.team_rosters.items():
+                self.jersey_to_player[team_name] = roster.copy()
+
+            logging.info(f"Loaded player databases for {len(self.team_rosters)} teams")
+
+        except Exception as e:
+            logging.warning(f"Failed to load player databases: {e}")
+            self.team_rosters = {}
+            self.jersey_to_player = {}
+
+    def analyze_player(self, frame: np.ndarray, obj: Dict[str, Any], frame_id: int) -> Dict[str, Any]:
+        """
+        Comprehensive player analysis combining all detection methods.
+
+        Args:
+            frame: Video frame
+            obj: Object detection result
+            frame_id: Current frame number
+
+        Returns:
+            Enhanced object with complete player information
+        """
+        try:
+            with self._lock:
+                object_id = obj.get('id', -1)
+                bbox = obj.get('bbox_video', [0, 0, 0, 0])
+
+                # Step 1: Detect jersey number
+                jersey_number = self.jersey_detector.detect_jersey_number(frame, bbox, object_id)
+
+                # Step 2: Identify team
+                team_name = self.team_identifier.classify_player(frame, bbox)
+
+                # Step 3: Get or create player info
+                player_info = self._get_or_create_player_info(object_id, jersey_number, team_name, frame_id)
+
+                # Step 4: Determine player name
+                player_name = self._determine_player_name(player_info)
+
+                # Step 5: Update object with complete information
+                obj.update({
+                    'jersey_number': player_info.jersey_number,
+                    'team': player_info.team_name,
+                    'player_name': player_name,
+                    'confidence_score': player_info.confidence_score,
+                    'detection_count': player_info.detection_count
+                })
+
+                # Step 6: Update player info
+                player_info.last_seen_frame = frame_id
+                self.player_registry[object_id] = player_info
+
+                return obj
+
+        except Exception as e:
+            logging.warning(f"Player analysis failed for object {obj.get('id', 'unknown')}: {e}")
+            # Return object with fallback values
+            obj.update({
+                'jersey_number': 0,
+                'team': 'Unknown',
+                'player_name': f"Player_{obj.get('id', 0)}",
+                'confidence_score': 0.0,
+                'detection_count': 0
+            })
+            return obj
+
+    def _get_or_create_player_info(self, object_id: int, jersey_number: int, team_name: str, frame_id: int) -> 'PlayerDatabase.PlayerInfo':
+        """Get existing player info or create new one"""
+        if object_id in self.player_registry:
+            player_info = self.player_registry[object_id]
+
+            # Update information if we have better detection
+            updated = False
+            if jersey_number > 0 and player_info.jersey_number != jersey_number:
+                player_info.jersey_number = jersey_number
+                updated = True
+
+            if team_name != 'Unknown' and player_info.team_name != team_name:
+                player_info.team_name = team_name
+                updated = True
+
+            player_info.update_confidence(updated)
+            return player_info
+        else:
+            # Create new player info
+            return self.PlayerInfo(
+                object_id=object_id,
+                jersey_number=jersey_number if jersey_number > 0 else 0,
+                team_name=team_name if team_name != 'Unknown' else 'Unknown',
+                player_name='',  # Will be determined later
+                confidence_score=0.5,
+                detection_count=1,
+                last_seen_frame=frame_id
+            )
+
+    def _determine_player_name(self, player_info: 'PlayerDatabase.PlayerInfo') -> str:
+        """Determine player name from jersey number and team"""
+        try:
+            team_name = player_info.team_name
+            jersey_number = player_info.jersey_number
+
+            # First, try to get name from known roster
+            if (team_name in self.jersey_to_player and
+                jersey_number in self.jersey_to_player[team_name]):
+                return self.jersey_to_player[team_name][jersey_number]
+
+            # If not in roster, generate descriptive name based on jersey number
+            if jersey_number > 0:
+                if jersey_number == 1:
+                    return f"{team_name}_Goalkeeper"
+                elif jersey_number <= 5:
+                    return f"{team_name}_Defender_{jersey_number}"
+                elif jersey_number <= 8:
+                    return f"{team_name}_Midfielder_{jersey_number}"
+                else:
+                    return f"{team_name}_Forward_{jersey_number}"
+            else:
+                # No jersey number detected
+                return f"{team_name}_Player_{player_info.object_id}"
+
+        except Exception as e:
+            logging.warning(f"Player name determination failed: {e}")
+            return f"Player_{player_info.object_id}"
+
+    def get_player_info(self, object_id: int) -> Optional['PlayerDatabase.PlayerInfo']:
+        """Get player information by object ID"""
+        return self.player_registry.get(object_id)
+
+    def get_team_roster(self, team_name: str) -> Dict[int, str]:
+        """Get complete roster for a team"""
+        return self.team_rosters.get(team_name, {})
+
+    def export_player_database(self) -> Dict[str, Any]:
+        """Export current player database for analysis"""
+        return {
+            'players': {
+                obj_id: {
+                    'jersey_number': info.jersey_number,
+                    'team_name': info.team_name,
+                    'player_name': self._determine_player_name(info),
+                    'confidence_score': info.confidence_score,
+                    'detection_count': info.detection_count,
+                    'last_seen_frame': info.last_seen_frame
+                }
+                for obj_id, info in self.player_registry.items()
+            },
+            'team_rosters': self.team_rosters
+        }
+
+    def load_external_roster(self, roster_file: str):
+        """Load team roster from external file (CSV, JSON, etc.)"""
+        try:
+            if roster_file.endswith('.csv'):
+                import pandas as pd
+                df = pd.read_csv(roster_file)
+                # Expected columns: team_name, jersey_number, player_name
+                for _, row in df.iterrows():
+                    team = row['team_name']
+                    jersey = int(row['jersey_number'])
+                    name = row['player_name']
+
+                    if team not in self.team_rosters:
+                        self.team_rosters[team] = {}
+                        self.jersey_to_player[team] = {}
+
+                    self.team_rosters[team][jersey] = name
+                    self.jersey_to_player[team][jersey] = name
+
+                logging.info(f"Loaded external roster from {roster_file}")
+
+        except Exception as e:
+            logging.error(f"Failed to load external roster: {e}")
+
+
+# --- 5.3. GEMINI TEAM IDENTIFIER ---
 class GeminiTeamIdentifier:
     """Uses Google Gemini to automatically identify teams from player crops."""
 
@@ -1642,6 +1895,13 @@ class VideoProcessor:
             # Initialize jersey number detector
             jersey_model_path = getattr(self.config, 'JERSEY_YOLO_MODEL_PATH', None)
             self.jersey_detector = JerseyNumberDetector(jersey_model_path)
+
+            # Initialize comprehensive player database
+            self.player_database = PlayerDatabase(self.jersey_detector, self.team_identifier)
+
+            # Load external roster if provided
+            if hasattr(self.config, 'TEAM_ROSTER_PATH') and self.config.TEAM_ROSTER_PATH:
+                self.player_database.load_external_roster(self.config.TEAM_ROSTER_PATH)
 
             # Initialize Gemini team identifier if enabled
             if self.config.ENABLE_GEMINI_TEAM_ID:
@@ -2098,27 +2358,21 @@ class VideoProcessor:
                     if actual_frame_id == 1:
                         logging.info("Homography calibration disabled in configuration - using fallback transformation")
 
-                # Classify team members and detect jersey numbers
+                # Comprehensive player analysis (team, jersey, name all at once)
                 for obj in objects:
                     if obj['type'] == 'person':
                         try:
-                            obj['team'] = self.team_identifier.classify_player(frame, obj['bbox_video'])
+                            # Use comprehensive player database for complete analysis
+                            obj = self.player_database.analyze_player(frame, obj, actual_frame_id)
                         except Exception as e:
-                            logging.warning(f"Team classification failed: {e}")
-                            obj['team'] = "Unknown"
-
-                        # Detect jersey number
-                        try:
-                            if hasattr(self, 'jersey_detector') and self.jersey_detector is not None:
-                                jersey_number = self.jersey_detector.detect_jersey_number(
-                                    frame, obj['bbox_video'], obj['id']
-                                )
-                                obj['jersey_number'] = jersey_number
-                            else:
-                                obj['jersey_number'] = 0
-                        except Exception as e:
-                            logging.warning(f"Jersey number detection failed for object {obj.get('id', 'unknown')}: {e}")
-                            obj['jersey_number'] = 0
+                            logging.warning(f"Comprehensive player analysis failed for object {obj.get('id', 'unknown')}: {e}")
+                            # Fallback to basic values
+                            obj.update({
+                                'team': 'Unknown',
+                                'jersey_number': 0,
+                                'player_name': f"Player_{obj.get('id', 0)}",
+                                'confidence_score': 0.0
+                            })
                 
                 # Apply homography transformation
                 try:
@@ -2256,9 +2510,63 @@ class VideoProcessor:
             
             # Export data
             self._export_data()
-            
+
+            # Export player database for analysis
+            self._export_player_database()
+
         except Exception as e:
             logging.error(f"Cleanup failed: {e}")
+
+    def _export_player_database(self) -> None:
+        """Export comprehensive player database for analysis and future use."""
+        try:
+            if hasattr(self, 'player_database') and self.player_database is not None:
+                # Export player database as JSON
+                player_db_path = self.config.OUTPUT_CSV_PATH.replace('.csv', '_player_database.json')
+                player_data = self.player_database.export_player_database()
+
+                with open(player_db_path, 'w') as f:
+                    json.dump(player_data, f, indent=2)
+
+                logging.info(f"Player database exported to {player_db_path}")
+
+                # Also export as CSV for easy viewing
+                csv_path = self.config.OUTPUT_CSV_PATH.replace('.csv', '_players.csv')
+                self._export_players_csv(player_data, csv_path)
+
+            else:
+                logging.warning("Player database not available for export")
+
+        except Exception as e:
+            logging.error(f"Player database export failed: {e}")
+
+    def _export_players_csv(self, player_data: Dict[str, Any], csv_path: str) -> None:
+        """Export player information as CSV."""
+        try:
+            import pandas as pd
+
+            # Convert player data to DataFrame
+            players_list = []
+            for obj_id, info in player_data.get('players', {}).items():
+                players_list.append({
+                    'object_id': obj_id,
+                    'jersey_number': info['jersey_number'],
+                    'team_name': info['team_name'],
+                    'player_name': info['player_name'],
+                    'confidence_score': info['confidence_score'],
+                    'detection_count': info['detection_count'],
+                    'last_seen_frame': info['last_seen_frame']
+                })
+
+            if players_list:
+                df = pd.DataFrame(players_list)
+                df.to_csv(csv_path, index=False)
+                logging.info(f"Player CSV exported to {csv_path}")
+            else:
+                logging.warning("No player data to export to CSV")
+
+        except Exception as e:
+            logging.warning(f"Player CSV export failed: {e}")
 
     def _export_data(self) -> None:
         """Export data in sports_analytics.csv format"""
@@ -2359,18 +2667,17 @@ class VideoProcessor:
                                 player_role = 'none'
                             else:
                                 object_type = 'player'
-                                # Generate player names based on team and ID
-                                if team_name != 'none' and team_name != 'unknown':
-                                    player_name = f"Player_{obj_id}"
-                                    # Use detected jersey number if available, otherwise assign one
-                                    jersey_number = obj.get('jersey_number', 0)
-                                    if jersey_number == 0:
-                                        jersey_number = self._assign_jersey_number(obj_id, team_name)
-                                    player_role = self._determine_player_role(obj, frame_data)
-                                else:
-                                    player_name = f"Unknown_{obj_id}"
-                                    jersey_number = obj.get('jersey_number', 0)
-                                    player_role = 'unknown'
+                                # Use comprehensive player information from database
+                                player_name = obj.get('player_name', f"Player_{obj_id}")
+                                jersey_number = obj.get('jersey_number', 0)
+                                team_name = obj.get('team', team_name)  # Use detected team
+
+                                # Fallback for jersey number if not detected
+                                if jersey_number == 0 and team_name not in ['none', 'unknown', 'Unknown']:
+                                    jersey_number = self._assign_jersey_number(obj_id, team_name)
+
+                                # Determine player role
+                                player_role = self._determine_player_role(obj, frame_data)
 
                             # Calculate speeds (placeholder logic)
                             player_speed_kmh = self._calculate_player_speed(obj, frame_data)

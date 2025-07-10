@@ -14,6 +14,7 @@ models:
     yolo_path: 'yolov13n.pt'
     segmentation_path: 'path/to/your/segmentation_model.pth'
     jersey_yolo_path: null
+    team_roster_path: null
 
 processing:
     team_n_clusters: 3
