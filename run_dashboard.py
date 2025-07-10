@@ -11,7 +11,6 @@ import logging
 import threading
 import signal
 import sys
-from pathlib import Path
 
 # Import our modules
 from ai import Config, VideoProcessor
