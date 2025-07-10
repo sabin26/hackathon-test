@@ -22,6 +22,10 @@ class SportsAnalyticsDashboard {
 		this.playerPositions = {}
 		this.events = []
 
+		// Simulation state
+		this.isSimulating = false
+		this.simulationInterval = null
+
 		this.init()
 	}
 
@@ -944,6 +948,14 @@ class SportsAnalyticsDashboard {
 		window.addEventListener('resize', () => {
 			this.resizeCharts()
 		})
+
+		// Handle simulation button
+		const simulationBtn = document.getElementById('simulation-btn')
+		if (simulationBtn) {
+			simulationBtn.addEventListener('click', () => {
+				this.toggleSimulation()
+			})
+		}
 	}
 
 	setupVideoUpload() {
@@ -1174,6 +1186,70 @@ class SportsAnalyticsDashboard {
 		return `${minutes.toString().padStart(2, '0')}:${seconds
 			.toString()
 			.padStart(2, '0')}`
+	}
+
+	toggleSimulation() {
+		const simulationBtn = document.getElementById('simulation-btn')
+
+		if (this.isSimulating) {
+			// Stop simulation
+			this.stopSimulation()
+			simulationBtn.innerHTML =
+				'<i class="fas fa-play-circle me-2"></i>Simulation'
+			simulationBtn.className = 'btn btn-warning'
+		} else {
+			// Start simulation
+			this.startSimulation()
+			simulationBtn.innerHTML =
+				'<i class="fas fa-stop-circle me-2"></i>Stop Simulation'
+			simulationBtn.className = 'btn btn-danger'
+		}
+	}
+
+	startSimulation() {
+		if (this.isSimulating) return
+
+		this.isSimulating = true
+		console.log('Starting simulation mode...')
+
+		// Send start simulation message to backend
+		if (this.ws && this.isConnected) {
+			this.ws.send(
+				JSON.stringify({
+					type: 'start_simulation',
+				})
+			)
+		}
+
+		// Update processing status
+		const statusElement = document.getElementById('processing-status')
+		if (statusElement) {
+			statusElement.innerHTML =
+				'<i class="fas fa-circle text-warning me-2"></i><span>Simulation Running</span>'
+		}
+	}
+
+	stopSimulation() {
+		if (!this.isSimulating) return
+
+		this.isSimulating = false
+		console.log('Stopping simulation mode...')
+
+		// Send stop simulation message to backend
+		if (this.ws && this.isConnected) {
+			this.ws.send(
+				JSON.stringify({
+					type: 'stop_simulation',
+				})
+			)
+		}
+
+		// Update processing status
+		const statusElement = document.getElementById('processing-status')
+		if (statusElement) {
+			statusElement.innerHTML =
+				'<i class="fas fa-circle text-secondary me-2"></i><span>Ready</span>'
+		}
 	}
 }
 

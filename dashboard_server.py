@@ -41,6 +41,10 @@ class DashboardServer:
         self.active_connections: List[WebSocket] = []
         self.latest_data: Dict[str, Any] = {}
         self.data_queue = queue.Queue(maxsize=100)  # Queue for thread-safe data passing
+
+        # Simulation state
+        self.is_simulating = False
+        self.simulation_task = None
         self.game_stats: Dict[str, Any] = {
             "total_frames": 0,
             "players_detected": 0,
@@ -286,7 +290,7 @@ class DashboardServer:
         try:
             data = json.loads(message)
             message_type = data.get("type")
-            
+
             if message_type == "ping":
                 await websocket.send_text(json.dumps({"type": "pong"}))
             elif message_type == "request_stats":
@@ -294,6 +298,10 @@ class DashboardServer:
                     "type": "stats_update",
                     "stats": self.game_stats
                 }))
+            elif message_type == "start_simulation":
+                await self.start_simulation()
+            elif message_type == "stop_simulation":
+                await self.stop_simulation()
         except json.JSONDecodeError:
             logger.warning(f"Invalid JSON received from client: {message}")
         except Exception as e:
@@ -774,6 +782,244 @@ class DashboardServer:
         except Exception as e:
             logger.error(f"Failed to stop video processing: {e}")
             raise
+
+    async def start_simulation(self):
+        """Start simulation mode with realistic analytics data"""
+        if self.is_simulating:
+            return
+
+        self.is_simulating = True
+        logger.info("Starting simulation mode...")
+
+        # Reset game stats for simulation
+        self._reset_game_stats()
+
+        # Start simulation task
+        self.simulation_task = asyncio.create_task(self._simulation_loop())
+
+    async def stop_simulation(self):
+        """Stop simulation mode"""
+        if not self.is_simulating:
+            return
+
+        self.is_simulating = False
+        logger.info("Stopping simulation mode...")
+
+        if self.simulation_task:
+            self.simulation_task.cancel()
+            try:
+                await self.simulation_task
+            except asyncio.CancelledError:
+                pass
+            self.simulation_task = None
+
+    async def _simulation_loop(self):
+        """Main simulation loop that generates realistic analytics data"""
+        import random
+        import math
+
+        frame_count = 0
+        game_time = 0
+
+        try:
+            while self.is_simulating:
+                frame_count += 1
+                game_time += 1/30  # Assuming 30 FPS
+
+                # Generate realistic frame data
+                frame_data = self._generate_realistic_frame_data(frame_count, game_time)
+
+                # Broadcast the data
+                await self.broadcast_frame_data(frame_data)
+
+                # Wait for next frame (30 FPS simulation)
+                await asyncio.sleep(1/30)
+
+        except asyncio.CancelledError:
+            logger.info("Simulation loop cancelled")
+        except Exception as e:
+            logger.error(f"Error in simulation loop: {e}")
+
+    def _reset_game_stats(self):
+        """Reset game statistics for new simulation"""
+        self.game_stats = {
+            "total_frames": 0,
+            "players_detected": 0,
+            "ball_detected": False,
+            "possession_stats": {"team_A": 0, "team_B": 0, "none": 0},
+            "events": [],
+            "player_positions": {},
+            "team_colors": {},
+            "performance_metrics": {
+                "fps": 30,
+                "processing_time": 0.033,
+                "detection_accuracy": 0.95
+            },
+            "team_stats": {
+                "team_A": {
+                    "possession_time": 0,
+                    "total_passes": 0,
+                    "successful_passes": 0,
+                    "shots_taken": 0,
+                    "shots_on_goal": 0,
+                    "goals_scored": 0,
+                    "distance_covered": 0,
+                    "average_speed": 0,
+                    "ball_touches": 0,
+                    "defensive_actions": 0
+                },
+                "team_B": {
+                    "possession_time": 0,
+                    "total_passes": 0,
+                    "successful_passes": 0,
+                    "shots_taken": 0,
+                    "shots_on_goal": 0,
+                    "goals_scored": 0,
+                    "distance_covered": 0,
+                    "average_speed": 0,
+                    "ball_touches": 0,
+                    "defensive_actions": 0
+                }
+            },
+            "player_stats": {},
+            "game_flow": {
+                "possession_changes": [],
+                "momentum_indicator": 0,
+                "activity_zones": {},
+                "game_intensity": 0
+            },
+            "event_analytics": {
+                "event_frequency": {
+                    "Pass": 0,
+                    "Shot": 0,
+                    "Possession": 0,
+                    "Dribble": 0,
+                    "Tackle": 0,
+                    "Interception": 0
+                },
+                "event_success_rates": {
+                    "Pass": {"successful": 0, "total": 0},
+                    "Shot": {"successful": 0, "total": 0},
+                    "Dribble": {"successful": 0, "total": 0}
+                },
+                "event_timeline": [],
+                "heat_zones": {
+                    "defensive_third": {"team_A": 0, "team_B": 0},
+                    "middle_third": {"team_A": 0, "team_B": 0},
+                    "attacking_third": {"team_A": 0, "team_B": 0}
+                }
+            }
+        }
+
+    def _generate_realistic_frame_data(self, frame_count: int, game_time: float) -> Dict[str, Any]:
+        """Generate realistic frame data for simulation"""
+        import random
+        import math
+
+        # Field dimensions (in meters)
+        field_width = 105
+        field_height = 68
+
+        # Generate realistic player positions
+        players = []
+        num_players = random.randint(18, 22)  # Realistic number of visible players
+
+        for i in range(num_players):
+            # Assign team (roughly balanced)
+            team = "team_A" if i < num_players // 2 else "team_B"
+
+            # Generate realistic field positions
+            if team == "team_A":
+                # Team A tends to be on left side
+                x = random.uniform(0, field_width * 0.7)
+            else:
+                # Team B tends to be on right side
+                x = random.uniform(field_width * 0.3, field_width)
+
+            y = random.uniform(0, field_height)
+
+            # Add some movement variation
+            x += math.sin(game_time * 0.1 + i) * 2
+            y += math.cos(game_time * 0.15 + i) * 1.5
+
+            # Keep within bounds
+            x = max(0, min(field_width, x))
+            y = max(0, min(field_height, y))
+
+            # Generate realistic player data
+            player = {
+                "id": f"player_{i+1}",
+                "type": "person",
+                "bbox": [
+                    int(x * 10), int(y * 10),
+                    int(x * 10) + 20, int(y * 10) + 40
+                ],
+                "confidence": random.uniform(0.8, 0.98),
+                "pos_pitch": [x, y],
+                "team_name": team,
+                "jersey_number": str(random.randint(1, 23)),
+                "player_name": f"Player {i+1}",
+                "player_speed_kmh": random.uniform(5, 25),
+                "distance_covered_m": random.uniform(0.1, 0.5),
+                "ball_possession": False
+            }
+            players.append(player)
+
+        # Generate ball position
+        ball_x = random.uniform(10, field_width - 10)
+        ball_y = random.uniform(10, field_height - 10)
+
+        # Add ball movement
+        ball_x += math.sin(game_time * 0.3) * 5
+        ball_y += math.cos(game_time * 0.2) * 3
+        ball_x = max(0, min(field_width, ball_x))
+        ball_y = max(0, min(field_height, ball_y))
+
+        ball = {
+            "id": "ball_1",
+            "type": "sports ball",
+            "bbox": [int(ball_x * 10), int(ball_y * 10), int(ball_x * 10) + 10, int(ball_y * 10) + 10],
+            "confidence": random.uniform(0.85, 0.99),
+            "pos_pitch": [ball_x, ball_y]
+        }
+
+        # Assign ball possession to nearest player
+        min_distance = float('inf')
+        possessing_player = None
+        for player in players:
+            px, py = player["pos_pitch"]
+            distance = math.sqrt((px - ball_x)**2 + (py - ball_y)**2)
+            if distance < min_distance:
+                min_distance = distance
+                possessing_player = player
+
+        if possessing_player and min_distance < 3:  # Within 3 meters
+            possessing_player["ball_possession"] = True
+
+        # Generate realistic events occasionally
+        events = []
+        if random.random() < 0.05:  # 5% chance per frame
+            event_types = ["Pass", "Shot", "Dribble", "Tackle", "Interception"]
+            event_type = random.choice(event_types)
+
+            event = {
+                "type": event_type,
+                "timestamp": game_time,
+                "player_id": random.choice(players)["id"],
+                "team": random.choice(["team_A", "team_B"]),
+                "position": [ball_x, ball_y],
+                "success": random.random() > 0.3  # 70% success rate
+            }
+            events.append(event)
+
+        return {
+            "timestamp": game_time,
+            "frame_number": frame_count,
+            "objects": players + [ball],
+            "events": events,
+            "field_dimensions": [field_width, field_height],
+            "possession_team": possessing_player["team_name"] if possessing_player else "none"
+        }
 
     def run(self):
         """Run the server (blocking)"""

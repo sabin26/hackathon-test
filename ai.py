@@ -138,7 +138,6 @@ class Config:
                 # Performance optimization flags
                 cls.ENABLE_JERSEY_DETECTION = proc.get('enable_jersey_detection', True)
                 cls.ENABLE_OCR = proc.get('enable_ocr', True)
-                cls.OPTIMIZE_FOR_SPEED = proc.get('optimize_for_speed', False)
 
 
                 
@@ -317,38 +316,50 @@ class SegmentationModel:
             return self._placeholder_predict(frame)
 
     def _placeholder_predict(self, frame: np.ndarray) -> np.ndarray:
-        """A more realistic placeholder that finds lines on the green parts of the pitch."""
+        """Optimized placeholder that finds lines on the green parts of the pitch with reduced computation."""
         try:
             # Check for invalid frame
             if frame is None or frame.size == 0 or len(frame.shape) != 3:
                 return np.zeros((0, 0), dtype=np.uint8)
 
-            hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-            
-            # More robust green detection with multiple ranges
-            lower_green1 = np.array([35, 40, 40])
-            upper_green1 = np.array([85, 255, 255])
-            lower_green2 = np.array([45, 60, 60])
-            upper_green2 = np.array([75, 255, 255])
-            
-            pitch_mask1 = cv2.inRange(hsv_frame, lower_green1, upper_green1)
-            pitch_mask2 = cv2.inRange(hsv_frame, lower_green2, upper_green2)
-            pitch_mask = cv2.bitwise_or(pitch_mask1, pitch_mask2)
-            
-            # Improved morphological operations
-            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-            pitch_mask = cv2.morphologyEx(pitch_mask, cv2.MORPH_CLOSE, kernel)
-            pitch_mask = cv2.morphologyEx(pitch_mask, cv2.MORPH_OPEN, kernel)
-            
-            frame_on_pitch = cv2.bitwise_and(frame, frame, mask=pitch_mask)
-            gray_on_pitch = cv2.cvtColor(frame_on_pitch, cv2.COLOR_BGR2GRAY)
-            
-            # Apply Gaussian blur before edge detection
-            gray_on_pitch = cv2.GaussianBlur(gray_on_pitch, (3, 3), 0)
-            line_mask = cv2.Canny(gray_on_pitch, 50, 150, apertureSize=3)
-            
+            # Performance optimization: Resize frame to reduce computation
+            height, width = frame.shape[:2]
+            if height > 480 or width > 640:
+                scale_factor = min(640/width, 480/height)
+                new_width = int(width * scale_factor)
+                new_height = int(height * scale_factor)
+                frame_resized = cv2.resize(frame, (new_width, new_height))
+            else:
+                frame_resized = frame
+                scale_factor = 1.0
+
+            hsv_frame = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2HSV)
+
+            # Simplified green detection with single range for performance
+            lower_green = np.array([40, 50, 50])
+            upper_green = np.array([80, 255, 255])
+
+            pitch_mask = cv2.inRange(hsv_frame, lower_green, upper_green)
+
+            # Simplified morphological operations
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))  # Smaller kernel
+            pitch_mask = cv2.morphologyEx(pitch_mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+            # Skip the bitwise_and operation and work directly on grayscale
+            gray_frame = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2GRAY)
+
+            # Apply mask directly to grayscale
+            gray_masked = cv2.bitwise_and(gray_frame, pitch_mask)
+
+            # Skip Gaussian blur for performance
+            line_mask = cv2.Canny(gray_masked, 50, 150, apertureSize=3)
+
+            # Scale back to original size if needed
+            if scale_factor != 1.0:
+                line_mask = cv2.resize(line_mask, (width, height), interpolation=cv2.INTER_NEAREST)
+
             return line_mask
-            
+
         except Exception as e:
             logging.error(f"Placeholder prediction failed: {e}")
             # Return appropriate empty array based on frame validity
@@ -971,26 +982,34 @@ class TeamIdentifier:
             return None
 
     def collect_and_store_sample(self, frame: np.ndarray, bbox: List[int]) -> None:
-        """Collects feature vector and corresponding crop image with thread safety."""
+        """Collects feature vector and corresponding crop image with thread safety and rate limiting."""
         with self._lock:
+            # Performance optimization: Limit sample collection frequency
+            # Only collect samples every few frames to reduce computational load
+            current_time = time.time()
+            if hasattr(self, 'last_sample_time'):
+                if current_time - self.last_sample_time < 0.5:  # 0.5 second cooldown
+                    return
+            self.last_sample_time = current_time
+
             features = self._extract_player_features(frame, bbox)
             if features is None:
                 return
-                
+
             self.feature_samples.append(features)
-            
+
             # Store crop for HITL display
             try:
                 x1, y1, x2, y2 = bbox
                 h, w = y2 - y1, x2 - x1
-                
+
                 crop_y1 = max(0, y1 + int(h * 0.2))
                 crop_y2 = min(frame.shape[0], y1 + int(h * 0.7))
                 crop_x1 = max(0, x1 + int(w * 0.2))
                 crop_x2 = min(frame.shape[1], x1 + int(w * 0.8))
-                
+
                 crop_bgr = frame[crop_y1:crop_y2, crop_x1:crop_x2]
-                
+
                 if crop_bgr.size > 0:
                     crop_resized = cv2.resize(crop_bgr, (64, 64))
                     self.crop_samples.append(crop_resized)
@@ -1002,7 +1021,7 @@ class TeamIdentifier:
                             self.example_crops[cluster_id].append(crop_resized)
                 else:
                     self.crop_samples.append(np.zeros((64, 64, 3), dtype=np.uint8))
-                        
+
             except Exception as e:
                 logging.error(f"Crop storage failed: {e}")
 
@@ -1066,6 +1085,7 @@ class JerseyNumberDetector:
         self.jersey_cache = {}  # Cache detected jersey numbers by object_id
         self.confidence_threshold = 0.5
         self.ocr_confidence_threshold = 0.6
+        self.last_ocr_times = {}  # Track last OCR time per object for rate limiting
         self._initialize_models(yolo_model_path)
 
     def _initialize_models(self, yolo_model_path: Optional[str] = None):
@@ -1131,7 +1151,7 @@ class JerseyNumberDetector:
 
     def detect_jersey_number(self, frame: np.ndarray, bbox: List[int], object_id: int) -> int:
         """
-        Detect jersey number from player crop.
+        Detect jersey number from player crop with optimized caching and frame skipping.
 
         Args:
             frame: Full video frame
@@ -1142,12 +1162,31 @@ class JerseyNumberDetector:
             Jersey number (0 if not detected)
         """
         try:
-            # Check cache first for consistency
+            # Check cache first - return immediately if we have ANY cached result
             if object_id in self.jersey_cache:
                 cached_number, confidence_count = self.jersey_cache[object_id]
-                # Return cached number if we have high confidence (seen multiple times)
-                if confidence_count >= 3:
+                # Return cached number immediately if we have any confidence
+                # Jersey numbers don't change during a game, so once detected, use cached value
+                if confidence_count >= 1:
                     return cached_number
+
+            # Performance optimization: Skip OCR if disabled or if we should limit frequency
+            if not getattr(Config, 'ENABLE_OCR', True):
+                return 0
+
+            # Limit OCR frequency per object to reduce computational load
+            # Only attempt OCR detection every 30 frames per object (1 second at 30fps)
+            current_time = time.time()
+            last_ocr_time_key = f"last_ocr_{object_id}"
+            if hasattr(self, 'last_ocr_times'):
+                if last_ocr_time_key in self.last_ocr_times:
+                    if current_time - self.last_ocr_times[last_ocr_time_key] < 1.0:  # 1 second cooldown
+                        return 0
+            else:
+                self.last_ocr_times = {}
+
+            # Update last OCR time for this object
+            self.last_ocr_times[last_ocr_time_key] = current_time
 
             # Extract player crop
             player_crop = self._extract_player_crop(frame, bbox)
@@ -1159,12 +1198,13 @@ class JerseyNumberDetector:
             if torso_crop is None:
                 return 0
 
-            # Detect jersey number using OCR
+            # Detect jersey number using OCR (now called much less frequently)
             jersey_number = self._detect_number_with_ocr(torso_crop)
 
             # Update cache with detected number
             if jersey_number > 0:
                 self._update_jersey_cache(object_id, jersey_number)
+                logging.info(f"Detected jersey number {jersey_number} for object {object_id}")
                 return jersey_number
 
             # If no number detected, return cached number if available
@@ -1263,7 +1303,7 @@ class JerseyNumberDetector:
             return 0
 
     def _preprocess_for_ocr(self, crop: np.ndarray) -> np.ndarray:
-        """Preprocess image to improve OCR accuracy."""
+        """Preprocess image to improve OCR accuracy with optimized performance."""
         try:
             # Convert to grayscale
             if len(crop.shape) == 3:
@@ -1271,25 +1311,32 @@ class JerseyNumberDetector:
             else:
                 gray = crop.copy()
 
-            # Resize for better OCR (make it larger)
-            scale_factor = 3
+            # Optimized resize - use smaller scale factor to reduce computation
+            scale_factor = 2  # Reduced from 3 to 2 for better performance
             height, width = gray.shape
             new_height, new_width = height * scale_factor, width * scale_factor
-            resized = cv2.resize(gray, (new_width, new_height), interpolation=cv2.INTER_CUBIC)
+            resized = cv2.resize(gray, (new_width, new_height), interpolation=cv2.INTER_LINEAR)  # Changed from CUBIC to LINEAR for speed
 
-            # Apply contrast enhancement
-            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-            enhanced = clahe.apply(resized)
+            # Simplified contrast enhancement - use adaptive threshold instead of CLAHE
+            # CLAHE is computationally expensive, so we'll use a simpler approach
 
-            # Apply Gaussian blur to reduce noise
-            blurred = cv2.GaussianBlur(enhanced, (3, 3), 0)
+            # Apply simple contrast stretching
+            min_val, max_val = np.min(resized), np.max(resized)
+            if max_val > min_val:
+                enhanced = ((resized - min_val) / (max_val - min_val) * 255).astype(np.uint8)
+            else:
+                enhanced = resized
 
-            # Apply threshold to get binary image
-            _, binary = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            # Skip Gaussian blur to save computation time
+            # Apply adaptive threshold directly for better text detection
+            binary = cv2.adaptiveThreshold(
+                enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                cv2.THRESH_BINARY, 11, 2
+            )
 
-            # Morphological operations to clean up
-            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
-            cleaned = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+            # Simplified morphological operations
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 1))  # Smaller kernel
+            cleaned = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=1)
 
             return cleaned
 
@@ -1443,7 +1490,7 @@ class PlayerDatabase:
 
     def analyze_player(self, frame: np.ndarray, obj: Dict[str, Any], frame_id: int) -> Dict[str, Any]:
         """
-        Comprehensive player analysis combining all detection methods.
+        Comprehensive player analysis combining all detection methods with performance optimizations.
 
         Args:
             frame: Video frame
@@ -1458,14 +1505,40 @@ class PlayerDatabase:
                 object_id = obj.get('id', -1)
                 bbox = obj.get('bbox_video', [0, 0, 0, 0])
 
-                # Step 1: Detect jersey number (if enabled)
+                # Performance optimization: Check if we already have complete info for this player
+                if object_id in self.player_registry:
+                    existing_player = self.player_registry[object_id]
+                    # If we have high confidence data, skip expensive analysis
+                    if (existing_player.confidence_score > 0.8 and
+                        existing_player.jersey_number > 0 and
+                        existing_player.team_name != 'Unknown'):
+
+                        # Update with cached information
+                        obj.update({
+                            'jersey_number': existing_player.jersey_number,
+                            'team': existing_player.team_name,
+                            'player_name': self._determine_player_name(existing_player),
+                            'confidence_score': existing_player.confidence_score,
+                            'detection_count': existing_player.detection_count
+                        })
+
+                        # Update last seen frame
+                        existing_player.last_seen_frame = frame_id
+                        return obj
+
+                # Step 1: Detect jersey number (if enabled and not already cached with high confidence)
                 if self.jersey_detector:
                     jersey_number = self.jersey_detector.detect_jersey_number(frame, bbox, object_id)
                 else:
                     jersey_number = 0  # Default when jersey detection is disabled
 
-                # Step 2: Identify team
-                team_name = self.team_identifier.classify_player(frame, bbox)
+                # Step 2: Identify team (skip if we already have team info with high confidence)
+                if (object_id in self.player_registry and
+                    self.player_registry[object_id].team_name != 'Unknown' and
+                    self.player_registry[object_id].confidence_score > 0.5):
+                    team_name = self.player_registry[object_id].team_name
+                else:
+                    team_name = self.team_identifier.classify_player(frame, bbox)
 
                 # Step 3: Get or create player info
                 player_info = self._get_or_create_player_info(object_id, jersey_number, team_name, frame_id)
@@ -2052,12 +2125,12 @@ class VideoProcessor:
                         except Exception as e:
                             logging.error(f"Team model fitting failed: {e}")
 
-                # Homography management with better error recovery (skip if optimizing for speed)
-                if (self.config.ENABLE_HOMOGRAPHY and
-                    not getattr(self.config, 'OPTIMIZE_FOR_SPEED', False)):
-                    # Only attempt calibration every few frames to reduce spam
+                # Homography management with better error recovery
+                if (self.config.ENABLE_HOMOGRAPHY):
+                    # Much more aggressive rate limiting for homography calculation
+                    # Only attempt calibration every 50 frames (2 seconds at 25fps) to reduce computational load
                     if (self.homography_manager.homography_matrix is None and
-                        actual_frame_id % 10 == 0):  # Try every 10th frame instead of every frame
+                        actual_frame_id % 50 == 0):  # Increased from 10 to 50 frames
                         try:
                             success = self.homography_manager.calculate_homography(frame)
                             if success:
@@ -2065,9 +2138,9 @@ class VideoProcessor:
                         except Exception as e:
                             logging.error(f"Homography calculation failed: {e}")
 
-                    # Periodically check homography quality (less frequently)
+                    # Much less frequent homography quality checks (every 10 seconds instead of every 6 seconds)
                     if (actual_frame_id > 0 and
-                        actual_frame_id % (self.config.HOMOGRAPHY_CHECK_INTERVAL * 2) == 0 and
+                        actual_frame_id % (self.config.HOMOGRAPHY_CHECK_INTERVAL * 4) == 0 and  # Increased from 2x to 4x
                         self.homography_manager.homography_matrix is not None):
                         try:
                             error = self.homography_manager.calculate_reprojection_error()
@@ -2079,40 +2152,23 @@ class VideoProcessor:
                 else:
                     # Homography disabled - log once and ensure we use fallback
                     if actual_frame_id == 1:
-                        if getattr(self.config, 'OPTIMIZE_FOR_SPEED', False):
-                            logging.info("Homography calibration disabled for speed optimization - using fallback transformation")
-                        else:
-                            logging.info("Homography calibration disabled in configuration - using fallback transformation")
+                        logging.info("Homography calibration disabled in configuration - using fallback transformation")
 
                 # Comprehensive player analysis (team, jersey, name all at once)
-                # Skip expensive analysis if optimizing for speed
-                if getattr(self.config, 'OPTIMIZE_FOR_SPEED', False):
-                    # Fast mode: minimal player analysis
-                    for obj in objects:
-                        if obj['type'] == 'person':
-                            team_name = "Team A" if obj.get('id', 0) % 2 == 0 else "Team B"
+                for obj in objects:
+                    if obj['type'] == 'person':
+                        try:
+                            # Use comprehensive player database for complete analysis
+                            obj = self.player_database.analyze_player(frame, obj, actual_frame_id)
+                        except Exception as e:
+                            logging.warning(f"Comprehensive player analysis failed for object {obj.get('id', 'unknown')}: {e}")
+                            # Fallback to basic values
                             obj.update({
-                                'team': team_name,  # Simple team assignment
-                                'jersey_number': obj.get('id', 0) % 99 + 1,  # Simple jersey assignment
+                                'team': 'Unknown',
+                                'jersey_number': 0,
                                 'player_name': f"Player_{obj.get('id', 0)}",
-                                'confidence_score': 0.8  # Default confidence
+                                'confidence_score': 0.0
                             })
-                else:
-                    # Full analysis mode
-                    for obj in objects:
-                        if obj['type'] == 'person':
-                            try:
-                                # Use comprehensive player database for complete analysis
-                                obj = self.player_database.analyze_player(frame, obj, actual_frame_id)
-                            except Exception as e:
-                                logging.warning(f"Comprehensive player analysis failed for object {obj.get('id', 'unknown')}: {e}")
-                                # Fallback to basic values
-                                obj.update({
-                                    'team': 'Unknown',
-                                    'jersey_number': 0,
-                                    'player_name': f"Player_{obj.get('id', 0)}",
-                                    'confidence_score': 0.0
-                                })
                 
                 # Apply homography transformation
                 try:
@@ -2155,9 +2211,14 @@ class VideoProcessor:
                 processing_time = time.time() - start_time
                 self.performance_metrics['processing_times'].append(processing_time)
                 self.performance_metrics['frames_processed'] += 1
-                
-                if processing_time > 1.0:  # Log slow frames
+
+                # Improved performance monitoring with different thresholds
+                if processing_time > 2.0:  # Very slow frames
                     logging.warning(f"Slow processing: {processing_time:.2f}s for frame {actual_frame_id}")
+                elif processing_time > 1.0:  # Moderately slow frames
+                    logging.info(f"Moderate processing time: {processing_time:.2f}s for frame {actual_frame_id}")
+                elif actual_frame_id % 100 == 0:  # Log every 100th frame for progress tracking
+                    logging.info(f"Processing frame {actual_frame_id} in {processing_time:.2f}s")
                 
                 frame_id += 1
                 

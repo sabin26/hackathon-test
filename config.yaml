@@ -35,7 +35,6 @@ processing:
     # Performance optimizations
     enable_jersey_detection: true # Disable jersey number detection for better performance
     enable_ocr: true # Disable OCR processing for better performance
-    optimize_for_speed: false # Enable speed optimizations
 
 logging:
     level: 'INFO'
