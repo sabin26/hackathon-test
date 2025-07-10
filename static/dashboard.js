@@ -1210,7 +1210,6 @@ class SportsAnalyticsDashboard {
 		if (this.isSimulating) return
 
 		this.isSimulating = true
-		console.log('Starting simulation mode...')
 
 		// Send start simulation message to backend
 		if (this.ws && this.isConnected) {
