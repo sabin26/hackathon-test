@@ -19,6 +19,7 @@ from collections import deque, defaultdict
 import warnings
 import psutil
 import gc
+import easyocr
 
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -64,6 +65,7 @@ class Config:
     }
     YOLO_MODEL_PATH = 'yolov8n.pt'
     SEGMENTATION_MODEL_PATH = 'path/to/your/segmentation_model.pth'
+    JERSEY_YOLO_MODEL_PATH = None  # Path to custom YOLO model trained for jersey number detection
     TEAM_SAMPLES_TO_COLLECT = 300
     HOMOGRAPHY_RECAL_THRESHOLD = 3.0
     HOMOGRAPHY_CHECK_INTERVAL = 150
@@ -109,6 +111,7 @@ class Config:
             if 'models' in config_data:
                 cls.YOLO_MODEL_PATH = config_data['models'].get('yolo_path', cls.YOLO_MODEL_PATH)
                 cls.SEGMENTATION_MODEL_PATH = config_data['models'].get('segmentation_path', cls.SEGMENTATION_MODEL_PATH)
+                cls.JERSEY_YOLO_MODEL_PATH = config_data['models'].get('jersey_yolo_path', cls.JERSEY_YOLO_MODEL_PATH)
             
             # Update processing parameters
             if 'processing' in config_data:
@@ -1035,7 +1038,241 @@ class TeamIdentifier:
             return "Unknown"
 
 
-# --- 5.1. GEMINI TEAM IDENTIFIER ---
+# --- 5.1. JERSEY NUMBER DETECTOR ---
+class JerseyNumberDetector:
+    """Detects jersey numbers from player crops using YOLO and OCR."""
+
+    def __init__(self, yolo_model_path: Optional[str] = None):
+        self.yolo_model = None
+        self.ocr_reader = None
+        self.jersey_cache = {}  # Cache detected jersey numbers by object_id
+        self.confidence_threshold = 0.5
+        self.ocr_confidence_threshold = 0.6
+        self._initialize_models(yolo_model_path)
+
+    def _initialize_models(self, yolo_model_path: Optional[str] = None):
+        """Initialize YOLO model and OCR reader for jersey number detection."""
+        try:
+            # Initialize YOLO model for number detection
+            # You can use a custom trained model or a general text detection model
+            if yolo_model_path and os.path.exists(yolo_model_path):
+                self.yolo_model = YOLO(yolo_model_path)
+                logging.info(f"Loaded custom YOLO model for jersey detection: {yolo_model_path}")
+            else:
+                # Fallback to general object detection model
+                # In practice, you'd want a model specifically trained for jersey numbers
+                logging.info("Using general YOLO model - consider training a specific jersey number detection model")
+
+            # Initialize EasyOCR for number recognition
+            try:
+                self.ocr_reader = easyocr.Reader(['en'], gpu=torch.cuda.is_available())
+                logging.info("EasyOCR initialized successfully")
+            except Exception as e:
+                logging.warning(f"Failed to initialize EasyOCR: {e}")
+                self.ocr_reader = None
+
+        except Exception as e:
+            logging.error(f"Failed to initialize jersey number detection: {e}")
+
+    def detect_jersey_number(self, frame: np.ndarray, bbox: List[int], object_id: int) -> int:
+        """
+        Detect jersey number from player crop.
+
+        Args:
+            frame: Full video frame
+            bbox: Player bounding box [x1, y1, x2, y2]
+            object_id: Tracking ID of the player
+
+        Returns:
+            Jersey number (0 if not detected)
+        """
+        try:
+            # Check cache first for consistency
+            if object_id in self.jersey_cache:
+                cached_number, confidence_count = self.jersey_cache[object_id]
+                # Return cached number if we have high confidence (seen multiple times)
+                if confidence_count >= 3:
+                    return cached_number
+
+            # Extract player crop
+            player_crop = self._extract_player_crop(frame, bbox)
+            if player_crop is None:
+                return 0
+
+            # Focus on torso area where jersey numbers are typically located
+            torso_crop = self._extract_torso_region(player_crop)
+            if torso_crop is None:
+                return 0
+
+            # Detect jersey number using OCR
+            jersey_number = self._detect_number_with_ocr(torso_crop)
+
+            # Update cache with detected number
+            if jersey_number > 0:
+                self._update_jersey_cache(object_id, jersey_number)
+                return jersey_number
+
+            # If no number detected, return cached number if available
+            if object_id in self.jersey_cache:
+                return self.jersey_cache[object_id][0]
+
+            return 0
+
+        except Exception as e:
+            logging.warning(f"Jersey number detection failed for object {object_id}: {e}")
+            return 0
+
+    def _extract_player_crop(self, frame: np.ndarray, bbox: List[int]) -> Optional[np.ndarray]:
+        """Extract player crop from frame with validation."""
+        try:
+            x1, y1, x2, y2 = bbox
+
+            # Validate bbox
+            if x1 >= x2 or y1 >= y2:
+                return None
+
+            # Ensure bbox is within frame bounds
+            h, w = frame.shape[:2]
+            x1 = max(0, min(x1, w-1))
+            y1 = max(0, min(y1, h-1))
+            x2 = max(x1+1, min(x2, w))
+            y2 = max(y1+1, min(y2, h))
+
+            crop = frame[y1:y2, x1:x2]
+
+            # Validate crop size
+            if crop.shape[0] < 50 or crop.shape[1] < 30:
+                return None
+
+            return crop
+
+        except Exception as e:
+            logging.warning(f"Player crop extraction failed: {e}")
+            return None
+
+    def _extract_torso_region(self, player_crop: np.ndarray) -> Optional[np.ndarray]:
+        """Extract torso region where jersey numbers are typically located."""
+        try:
+            h, w = player_crop.shape[:2]
+
+            # Focus on upper torso area (typically where numbers are)
+            # Adjust these ratios based on typical jersey number placement
+            torso_y1 = int(h * 0.15)  # Start from 15% down from top
+            torso_y2 = int(h * 0.65)  # End at 65% down from top
+            torso_x1 = int(w * 0.2)   # Start from 20% from left
+            torso_x2 = int(w * 0.8)   # End at 80% from left
+
+            torso_crop = player_crop[torso_y1:torso_y2, torso_x1:torso_x2]
+
+            if torso_crop.shape[0] < 20 or torso_crop.shape[1] < 15:
+                return None
+
+            return torso_crop
+
+        except Exception as e:
+            logging.warning(f"Torso region extraction failed: {e}")
+            return None
+
+    def _detect_number_with_ocr(self, torso_crop: np.ndarray) -> int:
+        """Detect jersey number using OCR."""
+        try:
+            if self.ocr_reader is None:
+                return 0
+
+            # Preprocess image for better OCR
+            processed_crop = self._preprocess_for_ocr(torso_crop)
+
+            # Run OCR
+            results = self.ocr_reader.readtext(processed_crop)
+
+            # Extract numbers from OCR results
+            for (_, text, confidence) in results:  # bbox not needed for this implementation
+                try:
+                    conf_value = float(confidence)
+                except (ValueError, TypeError):
+                    conf_value = 0.0
+                if conf_value > self.ocr_confidence_threshold:
+                    # Extract numeric characters
+                    numeric_text = ''.join(filter(str.isdigit, text))
+                    if numeric_text:
+                        number = int(numeric_text)
+                        # Validate jersey number range (typically 1-99)
+                        if 1 <= number <= 99:
+                            logging.debug(f"Detected jersey number: {number} (confidence: {conf_value:.2f})")
+                            return number
+
+            return 0
+
+        except Exception as e:
+            logging.warning(f"OCR number detection failed: {e}")
+            return 0
+
+    def _preprocess_for_ocr(self, crop: np.ndarray) -> np.ndarray:
+        """Preprocess image to improve OCR accuracy."""
+        try:
+            # Convert to grayscale
+            if len(crop.shape) == 3:
+                gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+            else:
+                gray = crop.copy()
+
+            # Resize for better OCR (make it larger)
+            scale_factor = 3
+            height, width = gray.shape
+            new_height, new_width = height * scale_factor, width * scale_factor
+            resized = cv2.resize(gray, (new_width, new_height), interpolation=cv2.INTER_CUBIC)
+
+            # Apply contrast enhancement
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+            enhanced = clahe.apply(resized)
+
+            # Apply Gaussian blur to reduce noise
+            blurred = cv2.GaussianBlur(enhanced, (3, 3), 0)
+
+            # Apply threshold to get binary image
+            _, binary = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+            # Morphological operations to clean up
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+            cleaned = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+
+            return cleaned
+
+        except Exception as e:
+            logging.warning(f"OCR preprocessing failed: {e}")
+            return crop
+
+    def _update_jersey_cache(self, object_id: int, jersey_number: int):
+        """Update jersey number cache with confidence tracking."""
+        try:
+            if object_id in self.jersey_cache:
+                cached_number, count = self.jersey_cache[object_id]
+                if cached_number == jersey_number:
+                    # Same number detected again, increase confidence
+                    self.jersey_cache[object_id] = (jersey_number, count + 1)
+                else:
+                    # Different number detected, reset if new number has higher confidence
+                    if count < 2:  # If cached number has low confidence, replace it
+                        self.jersey_cache[object_id] = (jersey_number, 1)
+            else:
+                # First detection for this object
+                self.jersey_cache[object_id] = (jersey_number, 1)
+
+        except Exception as e:
+            logging.warning(f"Jersey cache update failed: {e}")
+
+    def get_cached_jersey_number(self, object_id: int) -> int:
+        """Get cached jersey number for an object."""
+        if object_id in self.jersey_cache:
+            return self.jersey_cache[object_id][0]
+        return 0
+
+    def clear_cache(self):
+        """Clear the jersey number cache."""
+        self.jersey_cache.clear()
+
+
+# --- 5.2. GEMINI TEAM IDENTIFIER ---
 class GeminiTeamIdentifier:
     """Uses Google Gemini to automatically identify teams from player crops."""
 
@@ -1401,9 +1638,19 @@ class VideoProcessor:
             self.team_identifier = TeamIdentifier(self.config.MODEL_PARAMS['TEAM_N_CLUSTERS'])
             self.object_tracker = ObjectTracker(self.config.YOLO_MODEL_PATH)
             self.action_recognizer = ActionRecognizer()
-            
+
+            # Initialize jersey number detector
+            jersey_model_path = getattr(self.config, 'JERSEY_YOLO_MODEL_PATH', None)
+            self.jersey_detector = JerseyNumberDetector(jersey_model_path)
+
+            # Initialize Gemini team identifier if enabled
+            if self.config.ENABLE_GEMINI_TEAM_ID:
+                self.gemini_team_identifier = GeminiTeamIdentifier(self.config.GEMINI_API_KEY)
+            else:
+                self.gemini_team_identifier = None
+
             logging.info("All components initialized successfully")
-            
+
         except Exception as e:
             logging.error(f"Component initialization failed: {e}")
             raise
@@ -1851,7 +2098,7 @@ class VideoProcessor:
                     if actual_frame_id == 1:
                         logging.info("Homography calibration disabled in configuration - using fallback transformation")
 
-                # Classify team members
+                # Classify team members and detect jersey numbers
                 for obj in objects:
                     if obj['type'] == 'person':
                         try:
@@ -1859,6 +2106,19 @@ class VideoProcessor:
                         except Exception as e:
                             logging.warning(f"Team classification failed: {e}")
                             obj['team'] = "Unknown"
+
+                        # Detect jersey number
+                        try:
+                            if hasattr(self, 'jersey_detector') and self.jersey_detector is not None:
+                                jersey_number = self.jersey_detector.detect_jersey_number(
+                                    frame, obj['bbox_video'], obj['id']
+                                )
+                                obj['jersey_number'] = jersey_number
+                            else:
+                                obj['jersey_number'] = 0
+                        except Exception as e:
+                            logging.warning(f"Jersey number detection failed for object {obj.get('id', 'unknown')}: {e}")
+                            obj['jersey_number'] = 0
                 
                 # Apply homography transformation
                 try:
@@ -2001,77 +2261,174 @@ class VideoProcessor:
             logging.error(f"Cleanup failed: {e}")
 
     def _export_data(self) -> None:
-        """Fixed and enhanced data export with complete implementation"""
+        """Export data in sports_analytics.csv format"""
         if not self.results_data:
             logging.warning("No data was processed to export.")
             return
-        
+
         try:
             logging.info(f"Exporting {len(self.results_data)} frames of data...")
-            
+
             # Create backup of existing file
             if os.path.exists(self.config.OUTPUT_CSV_PATH):
                 backup_path = f"{self.config.OUTPUT_CSV_PATH}.backup_{int(time.time())}"
                 os.rename(self.config.OUTPUT_CSV_PATH, backup_path)
                 logging.info(f"Created backup: {backup_path}")
-            
+
             export_data = []
-            
+
+            # Initialize game state tracking
+            self._initialize_game_state()
+
+            # Track game state variables
+            ball_possession_team = "none"
+            ball_possession_player_id = ""
+
             # Add data validation and complete the export implementation
             valid_frames = 0
             for frame_data in self.results_data:
                 if not isinstance(frame_data, dict):
                     logging.warning(f"Invalid frame data type: {type(frame_data)}")
                     continue
-                
+
                 frame_id = frame_data.get('frame_id', -1)
                 if frame_id < 0:
                     logging.warning(f"Invalid frame_id: {frame_id}")
                     continue
-                
+
                 # Extract object data
                 objects = frame_data.get('objects', [])
                 actions = frame_data.get('actions', {})
                 timestamp = frame_data.get('timestamp', 0)
-                
+
+                # Update game state based on events
+                self._update_game_state(timestamp, [actions] if actions else [])
+
+                # Calculate game clock relative to period start
+                period_time = timestamp - self._game_state.get('period_start_time', 0)
+                game_clock = f"{int(period_time // 60):02d}:{int(period_time % 60):02d}"
+
+                # Determine ball possession from objects
+                ball_obj = None
+                player_objects = []
+                for obj in objects:
+                    if obj.get('type') == 'sports_ball':
+                        ball_obj = obj
+                    elif obj.get('type') == 'person':
+                        player_objects.append(obj)
+
+                # Improved ball possession logic - find closest player to ball
+                if ball_obj and player_objects:
+                    ball_pos = ball_obj.get('pos_pitch', [0, 0])
+                    closest_player = None
+                    min_distance = float('inf')
+
+                    for player in player_objects:
+                        player_pos = player.get('pos_pitch', [0, 0])
+                        if player_pos and ball_pos and len(player_pos) >= 2 and len(ball_pos) >= 2:
+                            # Calculate distance in meters (assuming pitch coordinates are in meters)
+                            distance = ((player_pos[0] - ball_pos[0])**2 + (player_pos[1] - ball_pos[1])**2)**0.5
+                            if distance < min_distance:
+                                min_distance = distance
+                                closest_player = player
+
+                    # Use realistic possession distance threshold (2 meters for soccer)
+                    possession_threshold = 2.0  # meters
+                    if closest_player and min_distance < possession_threshold:
+                        ball_possession_team = closest_player.get('team', 'none')
+                        ball_possession_player_id = str(closest_player.get('id', ''))
+                    else:
+                        # No clear possession - ball is loose
+                        ball_possession_team = "none"
+                        ball_possession_player_id = ""
+
                 # Create a row for each object
                 if objects:
                     for obj in objects:
                         try:
+                            obj_type = obj.get('type', 'unknown')
+                            obj_id = obj.get('id', -1)
+                            team_name = obj.get('team', 'none')
+
+                            # Map object types
+                            if obj_type == 'sports_ball':
+                                object_type = 'sports_ball'
+                                player_name = 'ball'
+                                jersey_number = 0
+                                team_name = 'none'
+                                player_role = 'none'
+                            else:
+                                object_type = 'player'
+                                # Generate player names based on team and ID
+                                if team_name != 'none' and team_name != 'unknown':
+                                    player_name = f"Player_{obj_id}"
+                                    # Use detected jersey number if available, otherwise assign one
+                                    jersey_number = obj.get('jersey_number', 0)
+                                    if jersey_number == 0:
+                                        jersey_number = self._assign_jersey_number(obj_id, team_name)
+                                    player_role = self._determine_player_role(obj, frame_data)
+                                else:
+                                    player_name = f"Unknown_{obj_id}"
+                                    jersey_number = obj.get('jersey_number', 0)
+                                    player_role = 'unknown'
+
+                            # Calculate speeds (placeholder logic)
+                            player_speed_kmh = self._calculate_player_speed(obj, frame_data)
+                            ball_speed_kmh = self._calculate_ball_speed(obj, frame_data) if obj_type == 'sports_ball' else ""
+
+                            # Determine events
+                            event_type, event_outcome, pass_recipient_id = self._determine_events(obj, actions, objects)
+
                             row = {
                                 'frame_id': frame_id,
-                                'timestamp': timestamp,
-                                'object_id': obj.get('id', -1),
-                                'object_type': obj.get('type', 'unknown'),
-                                'team': obj.get('team', 'unknown'),
-                                'confidence': obj.get('confidence', 0.0),
-                                'bbox_x1': obj.get('bbox_video', [0, 0, 0, 0])[0],
-                                'bbox_y1': obj.get('bbox_video', [0, 0, 0, 0])[1],
-                                'bbox_x2': obj.get('bbox_video', [0, 0, 0, 0])[2],
-                                'bbox_y2': obj.get('bbox_video', [0, 0, 0, 0])[3],
-                                'pitch_x': obj.get('pos_pitch', [0, 0])[0] if obj.get('pos_pitch') else None,
-                                'pitch_y': obj.get('pos_pitch', [0, 0])[1] if obj.get('pos_pitch') else None,
-                                'tracking_quality': obj.get('tracking_quality', 0.0),
-                                'action_event': actions.get('event', ''),
-                                'action_velocity': actions.get('velocity', 0.0)
+                                'timestamp': f"{timestamp:.2f}",
+                                'game_clock': game_clock,
+                                'period': self._game_state.get('period', 1),
+                                'score_team_A': self._game_state.get('score_team_A', 0),
+                                'score_team_B': self._game_state.get('score_team_B', 0),
+                                'ball_possession_team': ball_possession_team,
+                                'ball_possession_player_id': ball_possession_player_id,
+                                'object_id': obj_id,
+                                'player_name': player_name,
+                                'jersey_number': jersey_number,
+                                'team_name': team_name,
+                                'player_role': player_role,
+                                'object_type': object_type,
+                                'pitch_x': round(obj.get('pos_pitch', [0, 0])[0], 1) if obj.get('pos_pitch') and len(obj.get('pos_pitch', [])) >= 1 else 0.0,
+                                'pitch_y': round(obj.get('pos_pitch', [0, 0])[1], 1) if obj.get('pos_pitch') and len(obj.get('pos_pitch', [])) >= 2 else 0.0,
+                                'player_speed_kmh': player_speed_kmh,
+                                'ball_speed_kmh': ball_speed_kmh,
+                                'event_type': event_type,
+                                'event_outcome': event_outcome,
+                                'pass_recipient_id': pass_recipient_id
                             }
                             export_data.append(row)
                         except Exception as e:
                             logging.warning(f"Failed to process object in frame {frame_id}: {e}")
                 else:
-                    # Create a row even if no objects detected
+                    # Create a minimal row even if no objects detected
                     row = {
                         'frame_id': frame_id,
-                        'timestamp': timestamp,
+                        'timestamp': f"{timestamp:.2f}",
+                        'game_clock': game_clock,
+                        'period': self._game_state.get('period', 1),
+                        'score_team_A': self._game_state.get('score_team_A', 0),
+                        'score_team_B': self._game_state.get('score_team_B', 0),
+                        'ball_possession_team': 'none',
+                        'ball_possession_player_id': '',
                         'object_id': -1,
+                        'player_name': 'none',
+                        'jersey_number': 0,
+                        'team_name': 'none',
+                        'player_role': 'none',
                         'object_type': 'none',
-                        'team': 'none',
-                        'confidence': 0.0,
-                        'bbox_x1': 0, 'bbox_y1': 0, 'bbox_x2': 0, 'bbox_y2': 0,
-                        'pitch_x': None, 'pitch_y': None,
-                        'tracking_quality': 0.0,
-                        'action_event': actions.get('event', ''),
-                        'action_velocity': actions.get('velocity', 0.0)
+                        'pitch_x': 0.0,
+                        'pitch_y': 0.0,
+                        'player_speed_kmh': '',
+                        'ball_speed_kmh': '',
+                        'event_type': '',
+                        'event_outcome': '',
+                        'pass_recipient_id': ''
                     }
                     export_data.append(row)
                 
@@ -2081,9 +2438,16 @@ class VideoProcessor:
                 logging.error("No valid frames to export")
                 return
             
-            # Create DataFrame and validate
-            df = pd.DataFrame(export_data)
-            
+            # Create DataFrame with explicit column order to match sports_analytics.csv
+            column_order = [
+                'frame_id', 'timestamp', 'game_clock', 'period', 'score_team_A', 'score_team_B',
+                'ball_possession_team', 'ball_possession_player_id', 'object_id', 'player_name',
+                'jersey_number', 'team_name', 'player_role', 'object_type', 'pitch_x', 'pitch_y',
+                'player_speed_kmh', 'ball_speed_kmh', 'event_type', 'event_outcome', 'pass_recipient_id'
+            ]
+
+            df = pd.DataFrame(export_data, columns=column_order)
+
             # Check for required columns
             required_columns = ['frame_id', 'timestamp', 'object_type']
             missing_columns = [col for col in required_columns if col not in df.columns]
@@ -2091,42 +2455,16 @@ class VideoProcessor:
                 logging.error(f"Missing required columns: {missing_columns}")
                 return
             
-            # Add metadata to CSV
-            # Escape the JSON configuration to prevent CSV parsing issues
-            config_str = json.dumps(self.config.MODEL_PARAMS).replace('"', "'")
-            metadata_rows = [
-                ['# Video Processing Metadata'],
-                [f'# Video Path: {self.config.VIDEO_PATH}'],
-                [f'# Processing Date: {time.strftime("%Y-%m-%d %H:%M:%S")}'],
-                [f'# Total Frames: {self.total_frames}'],
-                [f'# Processed Frames: {valid_frames}'],
-                [f'# Video Hash: {self.video_hash}'],
-                [f'# Configuration: {config_str}'],
-                ['# End Metadata'],
-            ]
-            
-            # Write metadata and data
-            with open(self.config.OUTPUT_CSV_PATH, 'w', newline='') as f:
-                # Write metadata as plain text comments (not CSV rows)
-                for row in metadata_rows:
-                    f.write(row[0] + '\n')  # Write each comment as a single line
-                
-            # Append DataFrame without trailing newline to prevent extra empty row
-            csv_string = df.to_csv(index=False)
-            # Remove the trailing newline that pandas adds
-            csv_string = csv_string.rstrip('\n')
-
-            with open(self.config.OUTPUT_CSV_PATH, 'a', newline='') as f:
-                f.write(csv_string)
+            # Write DataFrame directly to CSV (no metadata comments to match sports_analytics.csv format)
+            df.to_csv(self.config.OUTPUT_CSV_PATH, index=False)
             
             logging.info(f"Successfully exported {len(export_data)} rows to {self.config.OUTPUT_CSV_PATH}")
             
             # Verify export
             try:
-                # Read CSV with more specific parameters to avoid parsing issues
+                # Read CSV to verify export
                 verification_df = pd.read_csv(
                     self.config.OUTPUT_CSV_PATH,
-                    comment='#',
                     skip_blank_lines=True,
                     na_filter=False  # Don't convert strings to NaN
                 )
@@ -2172,6 +2510,415 @@ class VideoProcessor:
                     logging.info(f"Restored backup: {latest_backup}")
                 except Exception as restore_error:
                     logging.error(f"Failed to restore backup: {restore_error}")
+
+    def _assign_jersey_number(self, obj_id: int, team_name: str) -> int:
+        """
+        Assign jersey numbers to players using the jersey detector.
+        Falls back to consistent ID-based assignment if detection fails.
+        """
+        try:
+            # First check if we have a detected jersey number from the current frame
+            if hasattr(self, 'jersey_detector') and self.jersey_detector is not None:
+                detected_number = self.jersey_detector.get_cached_jersey_number(obj_id)
+                if detected_number > 0:
+                    return detected_number
+
+            # If no detection, use consistent ID-based assignment as fallback
+            if not hasattr(self, '_jersey_assignments'):
+                self._jersey_assignments = {}
+
+            team_key = f"{team_name}_{obj_id}"
+
+            if team_key not in self._jersey_assignments:
+                # Get existing jersey numbers for this team
+                team_jerseys = set()
+                for key, jersey in self._jersey_assignments.items():
+                    if key.startswith(f"{team_name}_"):
+                        team_jerseys.add(jersey)
+
+                # Assign next available jersey number (1-99)
+                for jersey_num in range(1, 100):
+                    if jersey_num not in team_jerseys:
+                        self._jersey_assignments[team_key] = jersey_num
+                        break
+                else:
+                    # Fallback if all numbers are taken (shouldn't happen in practice)
+                    self._jersey_assignments[team_key] = (obj_id % 99) + 1
+
+            return self._jersey_assignments[team_key]
+
+        except Exception as e:
+            logging.warning(f"Jersey number assignment failed: {e}")
+            return (obj_id % 99) + 1  # Fallback to simple modulo
+
+    def _initialize_game_state(self):
+        """Initialize game state tracking variables."""
+        if not hasattr(self, '_game_state'):
+            self._game_state = {
+                'period': 1,
+                'score_team_A': 0,
+                'score_team_B': 0,
+                'game_start_time': 0,
+                'period_start_time': 0,
+                'total_game_time': 0,
+                'goals_scored': []
+            }
+
+    def _update_game_state(self, timestamp: float, events: List[Dict[str, Any]]):
+        """Update game state based on detected events."""
+        try:
+            if not hasattr(self, '_game_state'):
+                self._initialize_game_state()
+                self._game_state['game_start_time'] = timestamp
+                self._game_state['period_start_time'] = timestamp
+
+            # Update total game time
+            self._game_state['total_game_time'] = timestamp - self._game_state['game_start_time']
+
+            # Check for goals in events
+            for event in events:
+                if event.get('event_type') == 'Shot' and event.get('event_outcome') == 'goal':
+                    team = event.get('team', 'unknown')
+                    if team in ['Team_A', 'Cluster 0']:
+                        self._game_state['score_team_A'] += 1
+                    elif team in ['Team_B', 'Cluster 1']:
+                        self._game_state['score_team_B'] += 1
+
+                    self._game_state['goals_scored'].append({
+                        'timestamp': timestamp,
+                        'team': team,
+                        'player_id': event.get('object_id', -1)
+                    })
+
+            # Simple period management (45 minutes per half)
+            if self._game_state['total_game_time'] > 45 * 60 and self._game_state['period'] == 1:
+                self._game_state['period'] = 2
+                self._game_state['period_start_time'] = timestamp
+                logging.info("Switched to second half")
+
+        except Exception as e:
+            logging.warning(f"Game state update failed: {e}")
+
+    def _determine_player_role(self, obj: Dict[str, Any], frame_data: Dict[str, Any]) -> str:
+        """Determine player role based on position, team, and context."""
+        try:
+            pos_pitch = obj.get('pos_pitch', [0, 0])
+            if not pos_pitch or len(pos_pitch) < 2:
+                return 'unknown'
+
+            x, y = pos_pitch
+            team = obj.get('team', 'unknown')
+
+            # Get pitch dimensions from homography manager
+            pitch_width = self.homography_manager.pitch_dims[0] if hasattr(self, 'homography_manager') else 105
+            pitch_height = self.homography_manager.pitch_dims[1] if hasattr(self, 'homography_manager') else 68
+
+            # Determine which side of the pitch the team is defending
+            # This is a simplified assumption - in reality, this should be determined from game context
+            team_defending_left = team in ['Team_A', 'Cluster 0']  # Assumption
+
+            if team_defending_left:
+                # Team defends left side (x=0), attacks right side (x=pitch_width)
+                if x < pitch_width * 0.25:  # Defensive third
+                    if abs(y - pitch_height/2) < pitch_height * 0.2:  # Central
+                        return 'CB'  # Center Back
+                    else:
+                        return 'FB'  # Full Back
+                elif x > pitch_width * 0.75:  # Attacking third
+                    if abs(y - pitch_height/2) < pitch_height * 0.3:  # Central
+                        return 'ST'  # Striker
+                    else:
+                        return 'W'   # Winger
+                else:  # Middle third
+                    if abs(y - pitch_height/2) < pitch_height * 0.25:  # Central
+                        return 'CM'  # Central Midfielder
+                    else:
+                        return 'WM'  # Wide Midfielder
+            else:
+                # Team defends right side (x=pitch_width), attacks left side (x=0)
+                if x > pitch_width * 0.75:  # Defensive third
+                    if abs(y - pitch_height/2) < pitch_height * 0.2:  # Central
+                        return 'CB'  # Center Back
+                    else:
+                        return 'FB'  # Full Back
+                elif x < pitch_width * 0.25:  # Attacking third
+                    if abs(y - pitch_height/2) < pitch_height * 0.3:  # Central
+                        return 'ST'  # Striker
+                    else:
+                        return 'W'   # Winger
+                else:  # Middle third
+                    if abs(y - pitch_height/2) < pitch_height * 0.25:  # Central
+                        return 'CM'  # Central Midfielder
+                    else:
+                        return 'WM'  # Wide Midfielder
+
+        except Exception as e:
+            logging.warning(f"Player role determination failed: {e}")
+            return 'unknown'
+
+    def _calculate_player_speed(self, obj: Dict[str, Any], frame_data: Dict[str, Any]) -> str:
+        """Calculate player speed in km/h using proper coordinate system and frame rate."""
+        try:
+            # Get tracking history for this object
+            obj_id = obj.get('id', -1)
+            if obj_id in self.object_tracker.tracking_history:
+                history = self.object_tracker.tracking_history[obj_id]
+                if len(history) >= 2:
+                    # Get current and previous positions in pitch coordinates
+                    current_pos = obj.get('pos_pitch', [0, 0])
+
+                    # Find previous position in pitch coordinates from history
+                    prev_pos = None
+                    for i in range(len(history) - 2, -1, -1):  # Go backwards through history
+                        prev_entry = history[i]
+                        prev_bbox = prev_entry.get('bbox', [0, 0, 0, 0])
+
+                        # Convert previous bbox to pitch coordinates using homography
+                        if self.homography_manager.homography_matrix is not None:
+                            try:
+                                # Use bottom center of bbox for position
+                                x_center = (prev_bbox[0] + prev_bbox[2]) / 2
+                                y_bottom = prev_bbox[3]
+                                video_point = np.array([[[x_center, y_bottom]]], dtype=np.float32)
+
+                                pitch_point = cv2.perspectiveTransform(
+                                    video_point, self.homography_manager.homography_matrix
+                                )
+                                prev_pos = pitch_point.flatten().tolist()
+                                break
+                            except Exception:
+                                continue
+                        else:
+                            # Fallback: use simple scaling if no homography
+                            video_width, video_height = 1920, 1080  # Default assumption
+                            pitch_width, pitch_height = self.homography_manager.pitch_dims
+
+                            x_center = (prev_bbox[0] + prev_bbox[2]) / 2
+                            y_bottom = prev_bbox[3]
+
+                            prev_pos = [
+                                (x_center / video_width) * pitch_width,
+                                (y_bottom / video_height) * pitch_height
+                            ]
+                            break
+
+                    if current_pos and prev_pos and len(current_pos) >= 2 and len(prev_pos) >= 2:
+                        # Calculate distance in meters (pitch coordinates should be in meters)
+                        distance = ((current_pos[0] - prev_pos[0])**2 + (current_pos[1] - prev_pos[1])**2)**0.5
+
+                        # Use actual video frame rate instead of hardcoded value
+                        fps = self.fps if hasattr(self, 'fps') and self.fps > 0 else 30.0
+                        time_diff = 1.0 / fps  # seconds between frames
+
+                        # Calculate speed
+                        speed_ms = distance / time_diff  # m/s
+                        speed_kmh = speed_ms * 3.6  # km/h
+
+                        # Apply reasonable limits (human running speed typically 0-40 km/h)
+                        if speed_kmh > 50.0:  # Likely tracking error
+                            return ""
+
+                        return f"{speed_kmh:.1f}"
+
+            return ""
+
+        except Exception as e:
+            logging.warning(f"Player speed calculation failed: {e}")
+            return ""
+
+    def _calculate_ball_speed(self, obj: Dict[str, Any], frame_data: Dict[str, Any]) -> str:
+        """Calculate ball speed in km/h using proper coordinate system and frame rate."""
+        try:
+            # Get tracking history for this object
+            obj_id = obj.get('id', -1)
+            if obj_id in self.object_tracker.tracking_history:
+                history = self.object_tracker.tracking_history[obj_id]
+                if len(history) >= 2:
+                    # Get current and previous positions in pitch coordinates
+                    current_pos = obj.get('pos_pitch', [0, 0])
+
+                    # Find previous position in pitch coordinates from history
+                    prev_pos = None
+                    for i in range(len(history) - 2, -1, -1):  # Go backwards through history
+                        prev_entry = history[i]
+                        prev_bbox = prev_entry.get('bbox', [0, 0, 0, 0])
+
+                        # Convert previous bbox to pitch coordinates using homography
+                        if self.homography_manager.homography_matrix is not None:
+                            try:
+                                # Use center of bbox for ball position
+                                x_center = (prev_bbox[0] + prev_bbox[2]) / 2
+                                y_center = (prev_bbox[1] + prev_bbox[3]) / 2
+                                video_point = np.array([[[x_center, y_center]]], dtype=np.float32)
+
+                                pitch_point = cv2.perspectiveTransform(
+                                    video_point, self.homography_manager.homography_matrix
+                                )
+                                prev_pos = pitch_point.flatten().tolist()
+                                break
+                            except Exception:
+                                continue
+                        else:
+                            # Fallback: use simple scaling if no homography
+                            video_width, video_height = 1920, 1080  # Default assumption
+                            pitch_width, pitch_height = self.homography_manager.pitch_dims
+
+                            x_center = (prev_bbox[0] + prev_bbox[2]) / 2
+                            y_center = (prev_bbox[1] + prev_bbox[3]) / 2
+
+                            prev_pos = [
+                                (x_center / video_width) * pitch_width,
+                                (y_center / video_height) * pitch_height
+                            ]
+                            break
+
+                    if current_pos and prev_pos and len(current_pos) >= 2 and len(prev_pos) >= 2:
+                        # Calculate distance in meters
+                        distance = ((current_pos[0] - prev_pos[0])**2 + (current_pos[1] - prev_pos[1])**2)**0.5
+
+                        # Use actual video frame rate
+                        fps = self.fps if hasattr(self, 'fps') and self.fps > 0 else 30.0
+                        time_diff = 1.0 / fps  # seconds between frames
+
+                        # Calculate speed
+                        speed_ms = distance / time_diff  # m/s
+                        speed_kmh = speed_ms * 3.6  # km/h
+
+                        # Apply reasonable limits for ball speed (0-200 km/h for soccer)
+                        if speed_kmh > 200.0:  # Likely tracking error
+                            return ""
+
+                        return f"{speed_kmh:.1f}"
+
+            return ""
+
+        except Exception as e:
+            logging.warning(f"Ball speed calculation failed: {e}")
+            return ""
+
+    def _determine_events(self, obj: Dict[str, Any], actions: Dict[str, Any], all_objects: List[Dict[str, Any]]) -> Tuple[str, str, str]:
+        """Determine event type, outcome, and pass recipient with improved logic."""
+        try:
+            event_type = ""
+            event_outcome = ""
+            pass_recipient_id = ""
+
+            # Get pitch dimensions for goal detection
+            pitch_width = self.homography_manager.pitch_dims[0] if hasattr(self, 'homography_manager') else 105
+            pitch_height = self.homography_manager.pitch_dims[1] if hasattr(self, 'homography_manager') else 68
+
+            # Goal areas (assuming goals are at x=0 and x=pitch_width)
+            goal_area_depth = 5.5  # meters (standard goal area depth)
+            goal_width = 7.32  # meters (standard goal width)
+            goal_center_y = pitch_height / 2
+
+            # Check if this is a ball object
+            if obj.get('type') == 'sports_ball':
+                ball_pos = obj.get('pos_pitch', [0, 0])
+                if not ball_pos or len(ball_pos) < 2:
+                    return event_type, event_outcome, pass_recipient_id
+
+                # Find nearby players with proper distance calculation
+                nearby_players = []
+                for other_obj in all_objects:
+                    if other_obj.get('type') == 'person':
+                        other_pos = other_obj.get('pos_pitch', [0, 0])
+                        if other_pos and len(other_pos) >= 2:
+                            distance = ((ball_pos[0] - other_pos[0])**2 + (ball_pos[1] - other_pos[1])**2)**0.5
+                            if distance < 3.0:  # Within 3 meters
+                                nearby_players.append((other_obj, distance))
+
+                # Sort by distance
+                nearby_players.sort(key=lambda x: x[1])
+
+                # Improved event logic
+                if len(nearby_players) >= 2:
+                    # Potential pass situation
+                    player1, dist1 = nearby_players[0]
+                    player2, dist2 = nearby_players[1]
+
+                    # Check if players are from different teams (indicating a pass)
+                    if player1.get('team') == player2.get('team') and dist1 < 2.0:
+                        event_type = "Pass"
+                        event_outcome = "successful"
+                        pass_recipient_id = str(player2.get('id', ''))
+                    elif dist1 < 1.5:  # Very close to one player
+                        event_type = "Dribble"
+                        event_outcome = "successful"
+
+                elif len(nearby_players) == 1:
+                    player, distance = nearby_players[0]
+                    player_pos = player.get('pos_pitch', [0, 0])
+
+                    if distance < 1.5:  # Player has control
+                        # Check if near goal for shot detection
+                        near_left_goal = (ball_pos[0] < goal_area_depth and
+                                        abs(ball_pos[1] - goal_center_y) < goal_width/2 + 5)
+                        near_right_goal = (ball_pos[0] > pitch_width - goal_area_depth and
+                                         abs(ball_pos[1] - goal_center_y) < goal_width/2 + 5)
+
+                        if near_left_goal or near_right_goal:
+                            # Check ball speed for shot detection
+                            speed_str = self._calculate_ball_speed(obj, {})
+                            if speed_str:
+                                try:
+                                    speed = float(speed_str)
+                                    if speed > 30:  # High speed indicates shot
+                                        event_type = "Shot"
+                                        # Improved goal detection
+                                        in_left_goal = (ball_pos[0] <= 0 and
+                                                      abs(ball_pos[1] - goal_center_y) < goal_width/2)
+                                        in_right_goal = (ball_pos[0] >= pitch_width and
+                                                       abs(ball_pos[1] - goal_center_y) < goal_width/2)
+                                        event_outcome = "goal" if (in_left_goal or in_right_goal) else "miss"
+                                except ValueError:
+                                    pass
+
+                        if not event_type:  # No shot detected
+                            event_type = "Dribble"
+                            event_outcome = "successful"
+
+            elif obj.get('type') == 'person':
+                # Player-centric events
+                player_pos = obj.get('pos_pitch', [0, 0])
+                if not player_pos or len(player_pos) < 2:
+                    return event_type, event_outcome, pass_recipient_id
+
+                # Find ball
+                ball_obj = None
+                ball_distance = float('inf')
+                for other_obj in all_objects:
+                    if other_obj.get('type') == 'sports_ball':
+                        ball_pos = other_obj.get('pos_pitch', [0, 0])
+                        if ball_pos and len(ball_pos) >= 2:
+                            distance = ((player_pos[0] - ball_pos[0])**2 + (player_pos[1] - ball_pos[1])**2)**0.5
+                            if distance < ball_distance:
+                                ball_distance = distance
+                                ball_obj = other_obj
+
+                if ball_obj and ball_distance < 5.0:
+                    if ball_distance < 1.5:  # Player has possession
+                        # Determine action based on context and position
+                        near_left_goal = (player_pos[0] < goal_area_depth * 2 and
+                                        abs(player_pos[1] - goal_center_y) < goal_width + 10)
+                        near_right_goal = (player_pos[0] > pitch_width - goal_area_depth * 2 and
+                                         abs(player_pos[1] - goal_center_y) < goal_width + 10)
+
+                        if near_left_goal or near_right_goal:
+                            event_type = "Shot_Attempt"
+                            event_outcome = "in_progress"
+                        else:
+                            event_type = "Possession"
+                            event_outcome = "active"
+                    elif ball_distance < 3.0:  # Player approaching ball
+                        event_type = "Approach"
+                        event_outcome = "in_progress"
+
+            return event_type, event_outcome, pass_recipient_id
+
+        except Exception as e:
+            logging.warning(f"Event determination failed: {e}")
+            return "", "", ""
 
 
 if __name__ == '__main__':
