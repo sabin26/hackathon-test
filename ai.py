@@ -20,6 +20,7 @@ import warnings
 import psutil
 import gc
 import easyocr
+import asyncio
 
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -1819,7 +1820,7 @@ class ActionRecognizer:
 # --- 7. MAIN VIDEO PROCESSOR ORCHESTRATOR ---
 class VideoProcessor:
     """The main orchestrator for the entire analytics pipeline."""
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, enable_streaming: bool = False):
         self.config = config
         self.cap = None
         self.video_hash = None
@@ -1828,13 +1829,25 @@ class VideoProcessor:
         self.stop_event = threading.Event()
         self.processing_lock = threading.Lock()
         self.frame_skip_counter = 0
-        
+
+        # Real-time streaming support
+        self.enable_streaming = enable_streaming
+        self.dashboard_server = None
+        if enable_streaming:
+            try:
+                from dashboard_server import dashboard_server
+                self.dashboard_server = dashboard_server
+                logging.info("Real-time streaming enabled")
+            except ImportError:
+                logging.warning("Dashboard server not available, streaming disabled")
+                self.enable_streaming = False
+
         # Initialize video capture
         self._initialize_video()
-        
+
         # Initialize components
         self._initialize_components()
-        
+
         # Load existing state
         self.load_state()
 
@@ -2388,13 +2401,26 @@ class VideoProcessor:
                     actions = {}
 
                 # Store results with thread safety
+                frame_result = {
+                    "frame_id": actual_frame_id,
+                    "timestamp": actual_frame_id / self.fps if self.fps > 0 else 0,
+                    "actions": actions,
+                    "objects": objects
+                }
+
                 with self.processing_lock:
-                    self.results_data.append({
-                        "frame_id": actual_frame_id,
-                        "timestamp": actual_frame_id / self.fps if self.fps > 0 else 0,
-                        "actions": actions,
-                        "objects": objects
-                    })
+                    self.results_data.append(frame_result)
+
+                # Stream data to dashboard if enabled
+                if self.enable_streaming and self.dashboard_server:
+                    try:
+                        # Run the async broadcast in a thread-safe way
+                        asyncio.run_coroutine_threadsafe(
+                            self.dashboard_server.broadcast_frame_data(frame_result),
+                            asyncio.get_event_loop()
+                        )
+                    except Exception as e:
+                        logging.debug(f"Streaming failed: {e}")  # Use debug level to avoid spam
                 
                 # Track performance metrics
                 processing_time = time.time() - start_time
