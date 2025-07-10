@@ -5,12 +5,13 @@ This module provides a FastAPI-based WebSocket server for streaming
 real-time sports analytics data to a web dashboard.
 """
 
+import os
+import warnings
 import asyncio
 import json
 import logging
 import time
 import queue
-import os
 import shutil
 from typing import Dict, List, Any
 from pathlib import Path
@@ -20,6 +21,11 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+
+# Set environment variables and suppress warnings before importing any ML libraries
+os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
+warnings.filterwarnings("ignore", message=".*pin_memory.*not supported on MPS.*")
+warnings.filterwarnings("ignore", category=UserWarning, module="torch.utils.data.dataloader")
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)

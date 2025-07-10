@@ -12,6 +12,9 @@ import logging
 import json
 import torch
 import yaml
+
+# Set environment variable to disable pin_memory on MPS (Apple Silicon)
+os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
 from torchvision import transforms
 from ultralytics import YOLO
 from sklearn.cluster import KMeans
@@ -39,6 +42,11 @@ logging.basicConfig(
 
 # Suppress unnecessary warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
+# Suppress MPS pin_memory warning on Apple Silicon
+warnings.filterwarnings("ignore", message=".*pin_memory.*not supported on MPS.*")
+# Suppress other MPS-related warnings
+warnings.filterwarnings("ignore", message=".*MPS.*")
+warnings.filterwarnings("ignore", category=UserWarning, module="torch.utils.data.dataloader")
 
 @dataclass
 class SystemMetrics:
@@ -366,13 +374,18 @@ class ObjectTracker:
             if not os.path.exists(model_path):
                 logging.warning(f"Model file not found: {model_path}, downloading...")
                 # YOLO will auto-download if file doesn't exist
-            
-            self.model = YOLO(model_path)
-            # Test the model with a dummy frame
-            dummy_frame = np.zeros((640, 640, 3), dtype=np.uint8)
-            _ = self.model.predict(dummy_frame, verbose=False)
+
+            # Suppress pin_memory warnings during YOLO initialization
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", message=".*pin_memory.*")
+                warnings.filterwarnings("ignore", category=UserWarning, module="torch.utils.data.dataloader")
+                self.model = YOLO(model_path)
+                # Test the model with a dummy frame
+                dummy_frame = np.zeros((640, 640, 3), dtype=np.uint8)
+                _ = self.model.predict(dummy_frame, verbose=False)
+
             logging.info("Object tracker initialized successfully")
-            
+
         except Exception as e:
             logging.error(f"Failed to initialize YOLO model: {e}")
             raise
@@ -396,9 +409,13 @@ class ObjectTracker:
             
             objects = []
             if self.model is not None:
-                results = self.model.track(frame_resized, persist=True, 
-                                         classes=[0, 32], verbose=False, 
-                                         conf=0.3, iou=0.5)
+                # Suppress pin_memory warnings during YOLO tracking
+                with warnings.catch_warnings():
+                    warnings.filterwarnings("ignore", message=".*pin_memory.*")
+                    warnings.filterwarnings("ignore", category=UserWarning, module="torch.utils.data.dataloader")
+                    results = self.model.track(frame_resized, persist=True,
+                                             classes=[0, 32], verbose=False,
+                                             conf=0.3, iou=0.5)
                 
                 if results and results[0].boxes is not None:
                     # Ensure we have numpy arrays for iteration
@@ -1058,7 +1075,11 @@ class JerseyNumberDetector:
             # Initialize YOLO model for number detection
             # You can use a custom trained model or a general text detection model
             if yolo_model_path and os.path.exists(yolo_model_path):
-                self.yolo_model = YOLO(yolo_model_path)
+                # Suppress pin_memory warnings during YOLO initialization
+                with warnings.catch_warnings():
+                    warnings.filterwarnings("ignore", message=".*pin_memory.*")
+                    warnings.filterwarnings("ignore", category=UserWarning, module="torch.utils.data.dataloader")
+                    self.yolo_model = YOLO(yolo_model_path)
                 logging.info(f"Loaded custom YOLO model for jersey detection: {yolo_model_path}")
             else:
                 # Fallback to general object detection model
