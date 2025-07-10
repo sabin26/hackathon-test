@@ -35,7 +35,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - [%(threadName)s] - %(message)s',
     handlers=[
-        logging.FileHandler('sports_analytics.log'),
+        logging.FileHandler('sports_analytics.log', mode='w'),
         logging.StreamHandler()
     ]
 )
@@ -1672,6 +1672,17 @@ class ActionRecognizer:
 # --- 7. MAIN VIDEO PROCESSOR ORCHESTRATOR ---
 class VideoProcessor:
     """The main orchestrator for the entire analytics pipeline."""
+
+    def _reset_log_file(self):
+        """Reset the log file for a new video processing session."""
+        try:
+            # Clear the sports_analytics.log file by opening it in write mode
+            with open('sports_analytics.log', 'w'):
+                pass  # Just opening in 'w' mode clears the file
+            logging.info("Log file reset for new video processing session")
+        except Exception as e:
+            logging.warning(f"Failed to reset log file: {e}")
+
     def __init__(self, config: Config, enable_streaming: bool = False):
         self.config = config
         self.cap = None
@@ -1681,6 +1692,9 @@ class VideoProcessor:
         self.stop_event = threading.Event()
         self.processing_lock = threading.Lock()
         self.frame_skip_counter = 0
+
+        # Reset log file for new video processing session
+        self._reset_log_file()
 
         # Real-time streaming support
         self.enable_streaming = enable_streaming

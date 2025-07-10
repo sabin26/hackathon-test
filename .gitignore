@@ -21,3 +21,4 @@ analyzer_checkpoints/
 
 # uploads
 uploads/
+.DS_Store
