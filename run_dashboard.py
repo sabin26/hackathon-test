@@ -214,30 +214,32 @@ class DashboardRunner:
             logger.warning(f"Cleanup error: {e}")
 
 def main():
-    """Main entry point"""
+    """Main entry point - simplified for video upload functionality"""
     import argparse
-    
+
     parser = argparse.ArgumentParser(description="Real-time Sports Analytics Dashboard")
-    parser.add_argument("--config", default="config.yaml", help="Configuration file path")
     parser.add_argument("--host", default="localhost", help="Dashboard server host")
     parser.add_argument("--port", type=int, default=8000, help="Dashboard server port")
-    parser.add_argument("--video", help="Video file path (overrides config)")
-    
+
     args = parser.parse_args()
-    
-    # Create runner
-    runner = DashboardRunner(args.config, args.host, args.port)
-    
-    # Override video path if provided
-    if args.video:
-        if not Path(args.video).exists():
-            logger.error(f"Video file not found: {args.video}")
-            return 1
-        # We'll set this after config is loaded
-        runner.video_override = args.video
-    
-    # Run the system
-    return runner.run()
+
+    try:
+        # Create and start dashboard server (no video validation needed)
+        dashboard = DashboardServer(host=args.host, port=args.port)
+
+        logger.info("Starting Sports Analytics Dashboard...")
+        logger.info(f"Dashboard will be available at: http://{args.host}:{args.port}")
+        logger.info("Upload a video file to begin analysis")
+
+        dashboard.run()
+        return 0
+
+    except KeyboardInterrupt:
+        logger.info("Dashboard server stopped by user")
+        return 0
+    except Exception as e:
+        logger.error(f"Failed to start dashboard: {e}")
+        return 1
 
 if __name__ == "__main__":
     sys.exit(main())

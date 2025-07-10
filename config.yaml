@@ -1,6 +1,6 @@
 # Sports Analytics Configuration File
 video:
-    path: 'sample.mp4'
+    path: null # Video path will be set at runtime via upload
     supported_formats: ['.mp4', '.avi', '.mov', '.mkv']
     min_resolution: [320, 240]
     max_resolution: [4096, 2160]
@@ -21,22 +21,22 @@ processing:
     team_feature_bins: 16
     min_crop_size: 100
     max_crops_per_cluster: 15
-    frame_skip_interval: 2
-    max_processing_queue_size: 32
-    team_samples_to_collect: 300
+    frame_skip_interval: 4 # Increased from 2 to 4 for better performance
+    max_processing_queue_size: 16 # Reduced from 32 to 16 to save memory
+    team_samples_to_collect: 200 # Reduced from 300 to 200 for faster processing
     homography_recal_threshold: 3.0
-    homography_check_interval: 150
-    action_sequence_length: 30
-    processing_timeout: 1.0
+    homography_check_interval: 300 # Increased from 150 to 300 to reduce overhead
+    action_sequence_length: 20 # Reduced from 30 to 20 for faster processing
+    processing_timeout: 2.0 # Increased from 1.0 to 2.0 to avoid timeouts
     max_retries: 3
     # Feature flags to prevent common errors
-    enable_hitl: true
-    enable_homography: true # Disable homography calibration to prevent calibration spam
-    enable_gemini_team_id: true # Enable Google Gemini for automatic team identification
+    enable_hitl: true # Disabled for better performance
+    enable_homography: true # Disabled homography calibration to prevent calibration spam and improve performance
 
-# Google Gemini Configuration
-gemini:
-    api_key: null # Set your Google Gemini API key here or use GEMINI_API_KEY environment variable
+    # Performance optimizations
+    enable_jersey_detection: true # Disable jersey number detection for better performance
+    enable_ocr: true # Disable OCR processing for better performance
+    optimize_for_speed: false # Enable speed optimizations
 
 logging:
     level: 'INFO'

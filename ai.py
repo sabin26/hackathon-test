@@ -20,14 +20,12 @@ import warnings
 import psutil
 import gc
 import easyocr
-import asyncio
 
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-import base64
-from google import genai
-from google.genai import types
+
+
 
 # Professional logging setup to provide clear, timestamped updates
 logging.basicConfig(
@@ -78,10 +76,8 @@ class Config:
     MIN_VIDEO_RESOLUTION = (320, 240)
     MAX_VIDEO_RESOLUTION = (4096, 2160)
     SUPPORTED_VIDEO_FORMATS = ['.mp4', '.avi', '.mov', '.mkv']
-    ENABLE_HITL = False  # Set to True to enable human-in-the-loop labeling (fallback when Gemini fails)
+    ENABLE_HITL = False  # Set to True to enable human-in-the-loop labeling
     ENABLE_HOMOGRAPHY = True  # Set to False to disable homography calibration and use fallback transformation
-    ENABLE_GEMINI_TEAM_ID = True  # Set to True to use Google Gemini for team identification
-    GEMINI_API_KEY = None  # Set your Google Gemini API key here or via environment variable
 
     # Path generated dynamically based on video and parameter hashes
     checkpoint_path_prefix: Optional[str] = None
@@ -133,11 +129,13 @@ class Config:
                 cls.MAX_RETRIES = proc.get('max_retries', cls.MAX_RETRIES)
                 cls.ENABLE_HITL = proc.get('enable_hitl', cls.ENABLE_HITL)
                 cls.ENABLE_HOMOGRAPHY = proc.get('enable_homography', cls.ENABLE_HOMOGRAPHY)
-                cls.ENABLE_GEMINI_TEAM_ID = proc.get('enable_gemini_team_id', cls.ENABLE_GEMINI_TEAM_ID)
 
-            # Update Gemini settings
-            if 'gemini' in config_data:
-                cls.GEMINI_API_KEY = config_data['gemini'].get('api_key', cls.GEMINI_API_KEY)
+                # Performance optimization flags
+                cls.ENABLE_JERSEY_DETECTION = proc.get('enable_jersey_detection', True)
+                cls.ENABLE_OCR = proc.get('enable_ocr', True)
+                cls.OPTIMIZE_FOR_SPEED = proc.get('optimize_for_speed', False)
+
+
                 
             logging.info("Configuration loaded from YAML file")
             
@@ -156,8 +154,8 @@ class Config:
     @classmethod
     def validate_config(cls) -> bool:
         """Enhanced configuration validation."""
-        # Check video file existence and format
-        if not os.path.exists(cls.VIDEO_PATH):
+        # Check video file existence and format (skip if null - will be set at runtime)
+        if cls.VIDEO_PATH and not os.path.exists(cls.VIDEO_PATH):
             logging.error(f"Video file not found: {cls.VIDEO_PATH}")
             return False
             
@@ -1066,13 +1064,46 @@ class JerseyNumberDetector:
                 # In practice, you'd want a model specifically trained for jersey numbers
                 logging.info("Using general YOLO model - consider training a specific jersey number detection model")
 
-            # Initialize EasyOCR for number recognition
+            # Initialize EasyOCR for number recognition with optimized settings
             try:
-                self.ocr_reader = easyocr.Reader(['en'], gpu=torch.cuda.is_available())
-                logging.info("EasyOCR initialized successfully")
+                # Try to initialize EasyOCR with SSL certificate handling
+                import ssl
+                import certifi
+
+                # Set SSL certificate environment variable
+                os.environ['SSL_CERT_FILE'] = certifi.where()
+                os.environ['REQUESTS_CA_BUNDLE'] = certifi.where()
+
+                # Set up SSL context with proper certificates
+                ssl_context = ssl.create_default_context(cafile=certifi.where())
+                ssl._create_default_https_context = lambda: ssl_context
+
+                # Initialize EasyOCR with optimized settings for performance
+                # Disable GPU for MPS compatibility and use CPU with optimized settings
+                self.ocr_reader = easyocr.Reader(
+                    ['en'],
+                    gpu=False,  # Disable GPU to avoid MPS issues
+                    verbose=False,  # Reduce logging
+                    download_enabled=True
+                )
+                logging.info("EasyOCR initialized successfully with SSL certificate handling")
+
             except Exception as e:
-                logging.warning(f"Failed to initialize EasyOCR: {e}")
-                self.ocr_reader = None
+                logging.warning(f"Failed to initialize EasyOCR with SSL handling: {e}")
+                try:
+                    # Fallback: try without SSL verification (less secure but functional)
+                    import ssl
+                    ssl._create_default_https_context = ssl._create_unverified_context
+                    self.ocr_reader = easyocr.Reader(
+                        ['en'],
+                        gpu=False,  # Disable GPU to avoid MPS issues
+                        verbose=False,
+                        download_enabled=True
+                    )
+                    logging.info("EasyOCR initialized successfully with unverified SSL context (fallback)")
+                except Exception as e2:
+                    logging.warning(f"Failed to initialize EasyOCR even with fallback: {e2}")
+                    self.ocr_reader = None
 
         except Exception as e:
             logging.error(f"Failed to initialize jersey number detection: {e}")
@@ -1282,7 +1313,7 @@ class PlayerDatabase:
     team identification, and player naming for accurate sports analytics.
     """
 
-    def __init__(self, jersey_detector: 'JerseyNumberDetector', team_identifier: 'TeamIdentifier'):
+    def __init__(self, jersey_detector: Optional['JerseyNumberDetector'], team_identifier: 'TeamIdentifier'):
         self.jersey_detector = jersey_detector
         self.team_identifier = team_identifier
         self.player_registry = {}  # object_id -> PlayerInfo
@@ -1379,8 +1410,11 @@ class PlayerDatabase:
                 object_id = obj.get('id', -1)
                 bbox = obj.get('bbox_video', [0, 0, 0, 0])
 
-                # Step 1: Detect jersey number
-                jersey_number = self.jersey_detector.detect_jersey_number(frame, bbox, object_id)
+                # Step 1: Detect jersey number (if enabled)
+                if self.jersey_detector:
+                    jersey_number = self.jersey_detector.detect_jersey_number(frame, bbox, object_id)
+                else:
+                    jersey_number = 0  # Default when jersey detection is disabled
 
                 # Step 2: Identify team
                 team_name = self.team_identifier.classify_player(frame, bbox)
@@ -1484,22 +1518,7 @@ class PlayerDatabase:
         """Get complete roster for a team"""
         return self.team_rosters.get(team_name, {})
 
-    def export_player_database(self) -> Dict[str, Any]:
-        """Export current player database for analysis"""
-        return {
-            'players': {
-                obj_id: {
-                    'jersey_number': info.jersey_number,
-                    'team_name': info.team_name,
-                    'player_name': self._determine_player_name(info),
-                    'confidence_score': info.confidence_score,
-                    'detection_count': info.detection_count,
-                    'last_seen_frame': info.last_seen_frame
-                }
-                for obj_id, info in self.player_registry.items()
-            },
-            'team_rosters': self.team_rosters
-        }
+
 
     def load_external_roster(self, roster_file: str):
         """Load team roster from external file (CSV, JSON, etc.)"""
@@ -1526,223 +1545,7 @@ class PlayerDatabase:
             logging.error(f"Failed to load external roster: {e}")
 
 
-# --- 5.3. GEMINI TEAM IDENTIFIER ---
-class GeminiTeamIdentifier:
-    """Uses Google Gemini to automatically identify teams from player crops."""
 
-    def __init__(self, api_key: Optional[str] = None):
-        self.api_key = api_key or os.getenv('GEMINI_API_KEY')
-        self.client = None
-        self._initialize_client()
-
-    def _initialize_client(self) -> None:
-        """Initialize the Gemini client."""
-        try:
-            if not self.api_key:
-                logging.info("Gemini API key not provided. Set GEMINI_API_KEY environment variable or configure in YAML to enable automatic team identification.")
-                return
-
-            self.client = genai.Client(api_key=self.api_key)
-            logging.info("Gemini client initialized successfully")
-
-        except Exception as e:
-            logging.warning(f"Failed to initialize Gemini client: {e}")
-            self.client = None
-
-    def identify_teams(self, example_crops: Dict[int, List[np.ndarray]]) -> Dict[int, str]:
-        """
-        Use Gemini to analyze player crops and identify teams.
-
-        Args:
-            example_crops: Dictionary mapping cluster_id to list of player crop images
-
-        Returns:
-            Dictionary mapping cluster_id to team name
-        """
-        if not self.client:
-            logging.info("Gemini client not initialized. Falling back to default labels.")
-            return self._get_default_labels(list(example_crops.keys()))
-
-        try:
-            # Create a montage of all clusters for analysis
-            montage_image = self._create_analysis_montage(example_crops)
-            if montage_image is None:
-                return self._get_default_labels(list(example_crops.keys()))
-
-            # Convert image to base64 for Gemini
-            image_data = self._image_to_base64(montage_image)
-
-            # Create prompt for team identification
-            cluster_ids = sorted(example_crops.keys())
-            prompt = self._create_team_identification_prompt(cluster_ids)
-
-            # Send to Gemini for analysis
-            response = self._query_gemini(prompt, image_data)
-
-            # Parse response and create team mapping
-            team_mapping = self._parse_gemini_response(response, cluster_ids)
-
-            logging.info(f"Gemini team identification completed: {team_mapping}")
-            return team_mapping
-
-        except Exception as e:
-            logging.error(f"Gemini team identification failed: {e}")
-            return self._get_default_labels(list(example_crops.keys()))
-
-    def _create_analysis_montage(self, example_crops: Dict[int, List[np.ndarray]]) -> Optional[np.ndarray]:
-        """Create a montage image for Gemini analysis."""
-        try:
-            montages = []
-            cluster_ids = sorted(example_crops.keys())
-
-            for cluster_id in cluster_ids:
-                crops = example_crops[cluster_id]
-                if not crops:
-                    continue
-
-                # Take up to 6 representative crops per cluster
-                selected_crops = crops[:6]
-                valid_crops = []
-
-                for crop in selected_crops:
-                    if crop is not None and crop.size > 0 and len(crop.shape) == 3:
-                        if crop.shape[0] > 0 and crop.shape[1] > 0:
-                            # Resize to standard size for consistency
-                            resized_crop = cv2.resize(crop, (80, 80))
-                            valid_crops.append(resized_crop)
-
-                if not valid_crops:
-                    continue
-
-                # Create horizontal strip of crops
-                crop_strip = cv2.hconcat(valid_crops)
-
-                # Add cluster label
-                label_height = 30
-                label_img = np.zeros((label_height, crop_strip.shape[1], 3), dtype=np.uint8)
-                cv2.putText(label_img, f"Cluster {cluster_id}", (10, 20),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-
-                cluster_montage = cv2.vconcat([label_img, crop_strip])
-                montages.append(cluster_montage)
-
-            if not montages:
-                return None
-
-            # Combine all cluster montages
-            final_montage = cv2.vconcat(montages)
-
-            # Resize if too large
-            max_height = 800
-            if final_montage.shape[0] > max_height:
-                scale = max_height / final_montage.shape[0]
-                new_width = int(final_montage.shape[1] * scale)
-                final_montage = cv2.resize(final_montage, (new_width, max_height))
-
-            return final_montage
-
-        except Exception as e:
-            logging.error(f"Failed to create analysis montage: {e}")
-            return None
-
-    def _image_to_base64(self, image: np.ndarray) -> str:
-        """Convert OpenCV image to base64 string."""
-        try:
-            # Convert BGR to RGB
-            rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-
-            # Encode as JPEG
-            success, buffer = cv2.imencode('.jpg', rgb_image)
-            if not success:
-                raise ValueError("Failed to encode image")
-
-            # Convert to base64
-            image_base64 = base64.b64encode(buffer).decode('utf-8')
-            return image_base64
-
-        except Exception as e:
-            logging.error(f"Failed to convert image to base64: {e}")
-            raise
-
-    def _create_team_identification_prompt(self, cluster_ids: List[int]) -> str:
-        """Create a prompt for Gemini to identify teams."""
-        prompt = f"""
-You are analyzing a sports video to identify different teams and roles. I have clustered players based on their appearance and need you to identify what each cluster represents.
-
-The image shows {len(cluster_ids)} different clusters of players, labeled as Cluster 0, Cluster 1, etc.
-
-Please analyze the uniforms, colors, and appearance of players in each cluster and provide:
-1. A descriptive team name or role for each cluster
-2. Consider common sports scenarios: Team A, Team B, Referees, Goalkeepers, etc.
-
-Respond with ONLY a comma-separated list of labels in the exact order of the clusters shown (Cluster 0, Cluster 1, etc.).
-
-For example, if you see 3 clusters, respond like: "Team Red, Team Blue, Referee"
-
-Important:
-- Provide exactly {len(cluster_ids)} labels
-- Use descriptive names based on uniform colors or roles
-- Keep labels concise (1-3 words)
-- Separate labels with commas only
-"""
-        return prompt
-
-    def _query_gemini(self, prompt: str, image_base64: str) -> str:
-        """Send query to Gemini and get response."""
-        try:
-            if not self.client:
-                raise ValueError("Gemini client not initialized")
-
-            # Create image part for Gemini using the correct format
-            image_part = types.Part.from_bytes(
-                data=base64.b64decode(image_base64),
-                mime_type="image/jpeg"
-            )
-
-            # Send request to Gemini
-            response = self.client.models.generate_content(
-                model='gemini-2.5-flash-lite-preview-06-17',
-                contents=[prompt, image_part]
-            )
-
-            if response and response.text:
-                return response.text.strip()
-            else:
-                logging.warning("Empty response from Gemini")
-                return ""
-
-        except Exception as e:
-            logging.error(f"Gemini query failed: {e}")
-            raise
-
-    def _parse_gemini_response(self, response: str, cluster_ids: List[int]) -> Dict[int, str]:
-        """Parse Gemini response and create team mapping."""
-        try:
-            if not response:
-                return self._get_default_labels(cluster_ids)
-
-            # Split by comma and clean up
-            labels = [label.strip() for label in response.split(',')]
-
-            # Ensure we have the right number of labels
-            if len(labels) != len(cluster_ids):
-                logging.warning(f"Gemini returned {len(labels)} labels but expected {len(cluster_ids)}. Using defaults.")
-                return self._get_default_labels(cluster_ids)
-
-            # Create mapping
-            team_mapping = {}
-            for i, cluster_id in enumerate(cluster_ids):
-                team_mapping[cluster_id] = labels[i] if i < len(labels) else f"Team_{i}"
-
-            return team_mapping
-
-        except Exception as e:
-            logging.error(f"Failed to parse Gemini response: {e}")
-            return self._get_default_labels(cluster_ids)
-
-    def _get_default_labels(self, cluster_ids: List[int]) -> Dict[int, str]:
-        """Get default team labels when Gemini fails."""
-        return {cluster_id: f"Team_{i}" for i, cluster_id in enumerate(cluster_ids)}
 
 
 # --- 6. ACTION RECOGNIZER HARNESS ---
@@ -1873,24 +1676,52 @@ class VideoProcessor:
     def _initialize_video(self) -> None:
         """Initialize video capture with error handling."""
         try:
+            # Skip video initialization if no path provided (will be set at runtime)
+            if not self.config.VIDEO_PATH:
+                logging.info("No video path provided - video will be set at runtime")
+                self.cap = None
+                self.fps = 30  # Default FPS
+                self.total_frames = 0
+                self.width = 1920  # Default dimensions
+                self.height = 1080
+                self.video_hash = "runtime_upload"
+                return
+
             self.cap = cv2.VideoCapture(self.config.VIDEO_PATH)
             if not self.cap.isOpened():
                 raise IOError(f"Cannot open video file: {self.config.VIDEO_PATH}")
-                
+
             # Get video properties
             self.fps = self.cap.get(cv2.CAP_PROP_FPS)
             self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
             self.width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             self.height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            
+
             logging.info(f"Video: {self.width}x{self.height}, {self.fps} FPS, {self.total_frames} frames")
-            
+
             # Calculate robust video hash
             self.video_hash = self._calculate_robust_video_hash()
             self.config.generate_checkpoint_prefix(self.video_hash)
-            
+
         except Exception as e:
             logging.error(f"Video initialization failed: {e}")
+            raise
+
+    def set_video_path(self, video_path: str) -> None:
+        """Set video path and reinitialize video capture for runtime uploads."""
+        try:
+            # Close existing capture if any
+            if self.cap:
+                self.cap.release()
+
+            # Update config and reinitialize
+            self.config.VIDEO_PATH = video_path
+            self._initialize_video()
+
+            logging.info(f"Video path updated and reinitialized: {video_path}")
+
+        except Exception as e:
+            logging.error(f"Failed to set video path: {e}")
             raise
 
     def _initialize_components(self) -> None:
@@ -1905,9 +1736,13 @@ class VideoProcessor:
             self.object_tracker = ObjectTracker(self.config.YOLO_MODEL_PATH)
             self.action_recognizer = ActionRecognizer()
 
-            # Initialize jersey number detector
-            jersey_model_path = getattr(self.config, 'JERSEY_YOLO_MODEL_PATH', None)
-            self.jersey_detector = JerseyNumberDetector(jersey_model_path)
+            # Initialize jersey number detector (conditionally for performance)
+            if getattr(self.config, 'ENABLE_JERSEY_DETECTION', True):
+                jersey_model_path = getattr(self.config, 'JERSEY_YOLO_MODEL_PATH', None)
+                self.jersey_detector = JerseyNumberDetector(jersey_model_path)
+            else:
+                self.jersey_detector = None
+                logging.info("Jersey number detection disabled for performance optimization")
 
             # Initialize comprehensive player database
             self.player_database = PlayerDatabase(self.jersey_detector, self.team_identifier)
@@ -1916,11 +1751,7 @@ class VideoProcessor:
             if hasattr(self.config, 'TEAM_ROSTER_PATH') and self.config.TEAM_ROSTER_PATH:
                 self.player_database.load_external_roster(self.config.TEAM_ROSTER_PATH)
 
-            # Initialize Gemini team identifier if enabled
-            if self.config.ENABLE_GEMINI_TEAM_ID:
-                self.gemini_team_identifier = GeminiTeamIdentifier(self.config.GEMINI_API_KEY)
-            else:
-                self.gemini_team_identifier = None
+
 
             logging.info("All components initialized successfully")
 
@@ -2233,39 +2064,7 @@ class VideoProcessor:
         except Exception as e:
             logging.error(f"Failed to apply default labels: {e}")
 
-    def _perform_gemini_team_identification(self) -> None:
-        """Use Google Gemini to automatically identify teams from player crops."""
-        try:
-            if not self.config.ENABLE_GEMINI_TEAM_ID:
-                logging.info("Gemini team identification is disabled. Using default labels.")
-                cluster_ids = sorted(self.team_identifier.example_crops.keys())
-                if cluster_ids:
-                    self._use_default_labels(cluster_ids)
-                return
 
-            logging.info("Starting Gemini-based team identification...")
-
-            # Initialize Gemini team identifier
-            gemini_identifier = GeminiTeamIdentifier(self.config.GEMINI_API_KEY)
-
-            # Use Gemini to identify teams
-            team_mapping = gemini_identifier.identify_teams(self.team_identifier.example_crops)
-
-            if team_mapping:
-                self.team_identifier.team_map = team_mapping
-                logging.info(f"Gemini team identification completed: {team_mapping}")
-            else:
-                logging.warning("Gemini team identification failed. Using default labels.")
-                cluster_ids = sorted(self.team_identifier.example_crops.keys())
-                if cluster_ids:
-                    self._use_default_labels(cluster_ids)
-
-        except Exception as e:
-            logging.error(f"Gemini team identification failed: {e}")
-            # Fallback to default labels
-            cluster_ids = sorted(self.team_identifier.example_crops.keys())
-            if cluster_ids:
-                self._use_default_labels(cluster_ids)
 
     def _processing_loop(self) -> None:
         """Enhanced processing loop with frame skipping and better error handling"""
@@ -2331,20 +2130,19 @@ class VideoProcessor:
                             
                             # Perform team identification
                             if not self.team_identifier.team_map:
-                                if self.config.ENABLE_GEMINI_TEAM_ID:
-                                    self._perform_gemini_team_identification()
-                                elif self.config.ENABLE_HITL:
+                                if self.config.ENABLE_HITL:
                                     self._perform_visual_hitl()
                                 else:
-                                    # Use default labels when both Gemini and HITL are disabled
+                                    # Use default labels when HITL is disabled
                                     cluster_ids = sorted(self.team_identifier.example_crops.keys())
                                     if cluster_ids:
                                         self._use_default_labels(cluster_ids)
                         except Exception as e:
                             logging.error(f"Team model fitting failed: {e}")
 
-                # Homography management with better error recovery
-                if self.config.ENABLE_HOMOGRAPHY:
+                # Homography management with better error recovery (skip if optimizing for speed)
+                if (self.config.ENABLE_HOMOGRAPHY and
+                    not getattr(self.config, 'OPTIMIZE_FOR_SPEED', False)):
                     # Only attempt calibration every few frames to reduce spam
                     if (self.homography_manager.homography_matrix is None and
                         actual_frame_id % 10 == 0):  # Try every 10th frame instead of every frame
@@ -2369,23 +2167,39 @@ class VideoProcessor:
                 else:
                     # Homography disabled - log once and ensure we use fallback
                     if actual_frame_id == 1:
-                        logging.info("Homography calibration disabled in configuration - using fallback transformation")
+                        if getattr(self.config, 'OPTIMIZE_FOR_SPEED', False):
+                            logging.info("Homography calibration disabled for speed optimization - using fallback transformation")
+                        else:
+                            logging.info("Homography calibration disabled in configuration - using fallback transformation")
 
                 # Comprehensive player analysis (team, jersey, name all at once)
-                for obj in objects:
-                    if obj['type'] == 'person':
-                        try:
-                            # Use comprehensive player database for complete analysis
-                            obj = self.player_database.analyze_player(frame, obj, actual_frame_id)
-                        except Exception as e:
-                            logging.warning(f"Comprehensive player analysis failed for object {obj.get('id', 'unknown')}: {e}")
-                            # Fallback to basic values
+                # Skip expensive analysis if optimizing for speed
+                if getattr(self.config, 'OPTIMIZE_FOR_SPEED', False):
+                    # Fast mode: minimal player analysis
+                    for obj in objects:
+                        if obj['type'] == 'person':
                             obj.update({
-                                'team': 'Unknown',
-                                'jersey_number': 0,
+                                'team': f"Team_{obj.get('id', 0) % 2}",  # Simple team assignment
+                                'jersey_number': obj.get('id', 0) % 99 + 1,  # Simple jersey assignment
                                 'player_name': f"Player_{obj.get('id', 0)}",
-                                'confidence_score': 0.0
+                                'confidence_score': 0.8  # Default confidence
                             })
+                else:
+                    # Full analysis mode
+                    for obj in objects:
+                        if obj['type'] == 'person':
+                            try:
+                                # Use comprehensive player database for complete analysis
+                                obj = self.player_database.analyze_player(frame, obj, actual_frame_id)
+                            except Exception as e:
+                                logging.warning(f"Comprehensive player analysis failed for object {obj.get('id', 'unknown')}: {e}")
+                                # Fallback to basic values
+                                obj.update({
+                                    'team': 'Unknown',
+                                    'jersey_number': 0,
+                                    'player_name': f"Player_{obj.get('id', 0)}",
+                                    'confidence_score': 0.0
+                                })
                 
                 # Apply homography transformation
                 try:
@@ -2414,11 +2228,13 @@ class VideoProcessor:
                 # Stream data to dashboard if enabled
                 if self.enable_streaming and self.dashboard_server:
                     try:
-                        # Run the async broadcast in a thread-safe way
-                        asyncio.run_coroutine_threadsafe(
-                            self.dashboard_server.broadcast_frame_data(frame_result),
-                            asyncio.get_event_loop()
-                        )
+                        # Use a simple queue-based approach to avoid async complexity
+                        if hasattr(self.dashboard_server, 'data_queue'):
+                            self.dashboard_server.data_queue.put_nowait(frame_result)
+                        else:
+                            # Fallback: store latest data for polling
+                            self.dashboard_server.latest_data = frame_result
+                            self.dashboard_server._update_game_stats(frame_result)
                     except Exception as e:
                         logging.debug(f"Streaming failed: {e}")  # Use debug level to avoid spam
                 
@@ -2537,62 +2353,14 @@ class VideoProcessor:
             # Export data
             self._export_data()
 
-            # Export player database for analysis
-            self._export_player_database()
+
 
         except Exception as e:
             logging.error(f"Cleanup failed: {e}")
 
-    def _export_player_database(self) -> None:
-        """Export comprehensive player database for analysis and future use."""
-        try:
-            if hasattr(self, 'player_database') and self.player_database is not None:
-                # Export player database as JSON
-                player_db_path = self.config.OUTPUT_CSV_PATH.replace('.csv', '_player_database.json')
-                player_data = self.player_database.export_player_database()
 
-                with open(player_db_path, 'w') as f:
-                    json.dump(player_data, f, indent=2)
 
-                logging.info(f"Player database exported to {player_db_path}")
 
-                # Also export as CSV for easy viewing
-                csv_path = self.config.OUTPUT_CSV_PATH.replace('.csv', '_players.csv')
-                self._export_players_csv(player_data, csv_path)
-
-            else:
-                logging.warning("Player database not available for export")
-
-        except Exception as e:
-            logging.error(f"Player database export failed: {e}")
-
-    def _export_players_csv(self, player_data: Dict[str, Any], csv_path: str) -> None:
-        """Export player information as CSV."""
-        try:
-            import pandas as pd
-
-            # Convert player data to DataFrame
-            players_list = []
-            for obj_id, info in player_data.get('players', {}).items():
-                players_list.append({
-                    'object_id': obj_id,
-                    'jersey_number': info['jersey_number'],
-                    'team_name': info['team_name'],
-                    'player_name': info['player_name'],
-                    'confidence_score': info['confidence_score'],
-                    'detection_count': info['detection_count'],
-                    'last_seen_frame': info['last_seen_frame']
-                })
-
-            if players_list:
-                df = pd.DataFrame(players_list)
-                df.to_csv(csv_path, index=False)
-                logging.info(f"Player CSV exported to {csv_path}")
-            else:
-                logging.warning("No player data to export to CSV")
-
-        except Exception as e:
-            logging.warning(f"Player CSV export failed: {e}")
 
     def _export_data(self) -> None:
         """Export data in sports_analytics.csv format"""

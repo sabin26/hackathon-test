@@ -29,13 +29,14 @@ dependencies = [
     "supervision>=0.22.0",
     "ultralytics",
     "lap>=0.5.12",
-    "google-genai>=1.24.0",
     "easyocr>=1.7.2",
     "pillow>=11.3.0",
     "fastapi>=0.116.0",
     "uvicorn>=0.35.0",
     "websockets>=15.0.1",
     "jinja2>=3.1.6",
+    "certifi>=2025.7.9",
+    "python-multipart>=0.0.20",
 ]
 
 [tool.uv.sources]

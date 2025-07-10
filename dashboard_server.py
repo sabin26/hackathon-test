@@ -5,15 +5,19 @@ This module provides a FastAPI-based WebSocket server for streaming
 real-time sports analytics data to a web dashboard.
 """
 
+import asyncio
 import json
 import logging
 import time
+import queue
+import os
+import shutil
 from typing import Dict, List, Any
 from pathlib import Path
 
 import uvicorn
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, UploadFile, File, HTTPException
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -30,6 +34,7 @@ class DashboardServer:
         self.app = FastAPI(title="Sports Analytics Dashboard")
         self.active_connections: List[WebSocket] = []
         self.latest_data: Dict[str, Any] = {}
+        self.data_queue = queue.Queue(maxsize=100)  # Queue for thread-safe data passing
         self.game_stats: Dict[str, Any] = {
             "total_frames": 0,
             "players_detected": 0,
@@ -44,9 +49,22 @@ class DashboardServer:
                 "detection_accuracy": 0
             }
         }
-        
+
+        # Video processing state
+        self.current_video_path = None
+        self.video_processor = None
+        self.processing_thread = None
+        self.is_processing = False
+
+        # Create uploads directory
+        self.uploads_dir = Path("uploads")
+        self.uploads_dir.mkdir(exist_ok=True)
+
         self._setup_routes()
         self._setup_static_files()
+
+        # Start background task to process queue
+        self._queue_processor_task = None
     
     def _setup_static_files(self):
         """Setup static file serving for dashboard assets"""
@@ -94,6 +112,85 @@ class DashboardServer:
         async def health_check():
             """Health check endpoint"""
             return {"status": "healthy", "connections": len(self.active_connections)}
+
+        @self.app.post("/api/upload-video")
+        async def upload_video(file: UploadFile = File(...)):
+            """Handle video file upload"""
+            try:
+                # Validate file type
+                allowed_extensions = ['.mp4', '.avi', '.mov', '.mkv']
+                file_extension = Path(file.filename).suffix.lower()
+
+                if file_extension not in allowed_extensions:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Unsupported file format. Allowed: {', '.join(allowed_extensions)}"
+                    )
+
+                # Save uploaded file
+                file_path = self.uploads_dir / file.filename
+                with open(file_path, "wb") as buffer:
+                    shutil.copyfileobj(file.file, buffer)
+
+                self.current_video_path = str(file_path)
+
+                logger.info(f"Video uploaded successfully: {file.filename}")
+                return JSONResponse({
+                    "status": "success",
+                    "message": f"Video '{file.filename}' uploaded successfully",
+                    "filename": file.filename,
+                    "path": str(file_path)
+                })
+
+            except Exception as e:
+                logger.error(f"Video upload failed: {e}")
+                raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
+
+        @self.app.post("/api/start-analysis")
+        async def start_analysis():
+            """Start video analysis"""
+            try:
+                if not self.current_video_path or not os.path.exists(self.current_video_path):
+                    raise HTTPException(status_code=400, detail="No video file uploaded")
+
+                if self.is_processing:
+                    raise HTTPException(status_code=400, detail="Analysis already in progress")
+
+                # Start video processing in background
+                await self._start_video_processing()
+
+                return JSONResponse({
+                    "status": "success",
+                    "message": "Video analysis started"
+                })
+
+            except Exception as e:
+                logger.error(f"Failed to start analysis: {e}")
+                raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
+
+        @self.app.post("/api/stop-analysis")
+        async def stop_analysis():
+            """Stop video analysis"""
+            try:
+                await self._stop_video_processing()
+
+                return JSONResponse({
+                    "status": "success",
+                    "message": "Video analysis stopped"
+                })
+
+            except Exception as e:
+                logger.error(f"Failed to stop analysis: {e}")
+                raise HTTPException(status_code=500, detail=f"Stop failed: {str(e)}")
+
+        @self.app.get("/api/status")
+        async def get_processing_status():
+            """Get current processing status"""
+            return JSONResponse({
+                "is_processing": self.is_processing,
+                "current_video": Path(self.current_video_path).name if self.current_video_path else None,
+                "connections": len(self.active_connections)
+            })
     
     async def connect(self, websocket: WebSocket):
         """Accept new WebSocket connection"""
@@ -231,9 +328,29 @@ class DashboardServer:
         except Exception as e:
             logger.error(f"Error updating game stats: {e}")
     
+    async def _process_data_queue(self):
+        """Background task to process data queue and broadcast to clients"""
+        while True:
+            try:
+                # Check for new data in queue (non-blocking)
+                try:
+                    frame_data = self.data_queue.get_nowait()
+                    await self.broadcast_frame_data(frame_data)
+                    self.data_queue.task_done()
+                except queue.Empty:
+                    # No data available, wait a bit
+                    await asyncio.sleep(0.01)
+            except Exception as e:
+                logger.error(f"Queue processing error: {e}")
+                await asyncio.sleep(0.1)
+
     async def start_server(self):
         """Start the dashboard server"""
         logger.info(f"Starting dashboard server on {self.host}:{self.port}")
+
+        # Start queue processor
+        self._queue_processor_task = asyncio.create_task(self._process_data_queue())
+
         config = uvicorn.Config(
             app=self.app,
             host=self.host,
@@ -241,8 +358,83 @@ class DashboardServer:
             log_level="info"
         )
         server = uvicorn.Server(config)
-        await server.serve()
+
+        try:
+            await server.serve()
+        finally:
+            # Cancel queue processor when server stops
+            if self._queue_processor_task:
+                self._queue_processor_task.cancel()
+                try:
+                    await self._queue_processor_task
+                except asyncio.CancelledError:
+                    pass
     
+    async def _start_video_processing(self):
+        """Start video processing in background thread"""
+        try:
+            from ai import Config, VideoProcessor
+            import threading
+
+            # Load configuration
+            config = Config()
+            config.load_from_yaml("config.yaml")
+
+            # Override video path with uploaded file
+            config.VIDEO_PATH = self.current_video_path
+
+            # Validate configuration
+            if not config.validate_config():
+                raise Exception("Configuration validation failed")
+
+            # Create video processor with streaming enabled
+            self.video_processor = VideoProcessor(config, enable_streaming=True)
+
+            # Set the video path for runtime upload
+            if self.current_video_path:
+                self.video_processor.set_video_path(self.current_video_path)
+
+            # Set the dashboard server for streaming
+            if hasattr(self.video_processor, 'dashboard_server'):
+                self.video_processor.dashboard_server = self
+
+            # Start processing in background thread
+            def process_video():
+                try:
+                    self.is_processing = True
+                    logger.info(f"Starting video analysis: {self.current_video_path}")
+                    self.video_processor.start()
+                    logger.info("Video analysis completed")
+                except Exception as e:
+                    logger.error(f"Video processing failed: {e}")
+                finally:
+                    self.is_processing = False
+
+            self.processing_thread = threading.Thread(target=process_video, daemon=True)
+            self.processing_thread.start()
+
+        except Exception as e:
+            self.is_processing = False
+            logger.error(f"Failed to start video processing: {e}")
+            raise
+
+    async def _stop_video_processing(self):
+        """Stop video processing"""
+        try:
+            self.is_processing = False
+
+            if self.video_processor and hasattr(self.video_processor, 'stop_event'):
+                self.video_processor.stop_event.set()
+
+            if self.processing_thread and self.processing_thread.is_alive():
+                self.processing_thread.join(timeout=5)
+
+            logger.info("Video processing stopped")
+
+        except Exception as e:
+            logger.error(f"Failed to stop video processing: {e}")
+            raise
+
     def run(self):
         """Run the server (blocking)"""
         uvicorn.run(
