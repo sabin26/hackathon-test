@@ -30,7 +30,6 @@ processing:
     processing_timeout: 2.0 # Increased from 1.0 to 2.0 to avoid timeouts
     max_retries: 3
     # Feature flags to prevent common errors
-    enable_hitl: true # Disabled for better performance
     enable_homography: true # Disabled homography calibration to prevent calibration spam and improve performance
 
     # Performance optimizations

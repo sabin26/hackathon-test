@@ -177,6 +177,11 @@ class DashboardServer:
             try:
                 # Validate file type
                 allowed_extensions = ['.mp4', '.avi', '.mov', '.mkv']
+                if not file.filename:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="No filename provided in upload."
+                    )
                 file_extension = Path(file.filename).suffix.lower()
 
                 if file_extension not in allowed_extensions:
@@ -407,9 +412,9 @@ class DashboardServer:
                 team_name = action_data.get("team_name", "unknown")
 
                 # Map team names to standardized format
-                if team_name in ["Team_A", "Cluster 0"]:
+                if team_name in ["Team A", "Team_A", "Cluster 0"]:
                     team_key = "team_A"
-                elif team_name in ["Team_B", "Cluster 1"]:
+                elif team_name in ["Team B", "Team_B", "Cluster 1"]:
                     team_key = "team_B"
                 else:
                     team_key = None
@@ -493,7 +498,7 @@ class DashboardServer:
             for team_key in ["team_A", "team_B"]:
                 team_players = [
                     player_stat for player_id, player_stat in self.game_stats["player_stats"].items()
-                    if player_stat.get("team", "").replace("Team_", "team_").replace("Cluster 0", "team_A").replace("Cluster 1", "team_B") == team_key
+                    if player_stat.get("team", "").replace("Team A", "team_A").replace("Team B", "team_B").replace("Team_", "team_").replace("Cluster 0", "team_A").replace("Cluster 1", "team_B") == team_key
                 ]
 
                 if team_players:
@@ -513,7 +518,9 @@ class DashboardServer:
         except Exception as e:
             logger.error(f"Error updating team aggregates: {e}")
 
-    def _update_game_flow(self, current_possession_team: str, timestamp: float):
+    from typing import Optional
+
+    def _update_game_flow(self, current_possession_team: Optional[str], timestamp: float):
         """Update game flow analytics including momentum and possession changes"""
         try:
             # Track possession changes
@@ -566,9 +573,9 @@ class DashboardServer:
                 elif event_type == "Possession":
                     weight = 0.5
 
-                if team in ["Team_A", "Cluster 0"]:
+                if team in ["Team A", "Team_A", "Cluster 0"]:
                     team_a_score += weight
-                elif team in ["Team_B", "Cluster 1"]:
+                elif team in ["Team B", "Team_B", "Cluster 1"]:
                     team_b_score += weight
 
             # Calculate momentum (-1 to 1)
@@ -635,9 +642,9 @@ class DashboardServer:
 
                 # Update heat zones based on player position (simplified)
                 # This would need actual position data for accurate zone calculation
-                if team_name in ["Team_A", "Cluster 0"]:
+                if team_name in ["Team A", "Team_A", "Cluster 0"]:
                     team_key = "team_A"
-                elif team_name in ["Team_B", "Cluster 1"]:
+                elif team_name in ["Team B", "Team_B", "Cluster 1"]:
                     team_key = "team_B"
                 else:
                     team_key = None
@@ -727,8 +734,11 @@ class DashboardServer:
                 try:
                     self.is_processing = True
                     logger.info(f"Starting video analysis: {self.current_video_path}")
-                    self.video_processor.start()
-                    logger.info("Video analysis completed")
+                    if self.video_processor is not None:
+                        self.video_processor.start()
+                        logger.info("Video analysis completed")
+                    else:
+                        logger.error("Video processor is not initialized.")
                 except Exception as e:
                     logger.error(f"Video processing failed: {e}")
                 finally:

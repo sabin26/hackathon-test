@@ -76,7 +76,6 @@ class Config:
     MIN_VIDEO_RESOLUTION = (320, 240)
     MAX_VIDEO_RESOLUTION = (4096, 2160)
     SUPPORTED_VIDEO_FORMATS = ['.mp4', '.avi', '.mov', '.mkv']
-    ENABLE_HITL = False  # Set to True to enable human-in-the-loop labeling
     ENABLE_HOMOGRAPHY = True  # Set to False to disable homography calibration and use fallback transformation
 
     # Path generated dynamically based on video and parameter hashes
@@ -127,7 +126,6 @@ class Config:
                 cls.ACTION_SEQUENCE_LENGTH = proc.get('action_sequence_length', cls.ACTION_SEQUENCE_LENGTH)
                 cls.PROCESSING_TIMEOUT = proc.get('processing_timeout', cls.PROCESSING_TIMEOUT)
                 cls.MAX_RETRIES = proc.get('max_retries', cls.MAX_RETRIES)
-                cls.ENABLE_HITL = proc.get('enable_hitl', cls.ENABLE_HITL)
                 cls.ENABLE_HOMOGRAPHY = proc.get('enable_homography', cls.ENABLE_HOMOGRAPHY)
 
                 # Performance optimization flags
@@ -155,40 +153,43 @@ class Config:
     def validate_config(cls) -> bool:
         """Enhanced configuration validation."""
         # Check video file existence and format (skip if null - will be set at runtime)
-        if cls.VIDEO_PATH and not os.path.exists(cls.VIDEO_PATH):
-            logging.error(f"Video file not found: {cls.VIDEO_PATH}")
-            return False
-            
-        # Validate video file is readable
-        try:
-            test_cap = cv2.VideoCapture(cls.VIDEO_PATH)
-            if not test_cap.isOpened():
-                logging.error(f"Cannot open video file: {cls.VIDEO_PATH}")
+        if cls.VIDEO_PATH is not None:
+            if not os.path.exists(cls.VIDEO_PATH):
+                logging.error(f"Video file not found: {cls.VIDEO_PATH}")
                 return False
-            test_cap.release()
-        except Exception as e:
-            logging.error(f"Video validation failed: {e}")
-            return False
-            
-        video_ext = Path(cls.VIDEO_PATH).suffix.lower()
-        if video_ext not in cls.SUPPORTED_VIDEO_FORMATS:
-            logging.warning(f"Unsupported video format: {video_ext}")
-        
+
+            # Validate video file is readable
+            try:
+                test_cap = cv2.VideoCapture(cls.VIDEO_PATH)
+                if not test_cap.isOpened():
+                    logging.error(f"Cannot open video file: {cls.VIDEO_PATH}")
+                    return False
+                test_cap.release()
+            except Exception as e:
+                logging.error(f"Video validation failed: {e}")
+                return False
+
+            video_ext = Path(cls.VIDEO_PATH).suffix.lower()
+            if video_ext not in cls.SUPPORTED_VIDEO_FORMATS:
+                logging.warning(f"Unsupported video format: {video_ext}")
+        else:
+            logging.info("Video path is null - will be set at runtime via upload")
+
         # Check available memory
         available_memory = psutil.virtual_memory().available / (1024**3)  # GB
         if available_memory < 2.0:
             logging.warning(f"Low available memory: {available_memory:.1f}GB")
-        
+
         # Validate model parameters
         if cls.MODEL_PARAMS['TEAM_N_CLUSTERS'] < 2:
             logging.error("TEAM_N_CLUSTERS must be at least 2")
             return False
-            
+
         output_dir = os.path.dirname(cls.OUTPUT_CSV_PATH) or '.'
         if not os.access(output_dir, os.W_OK):
             logging.error(f"Output directory is not writable: {output_dir}")
             return False
-            
+
         return True
 
     @classmethod
@@ -900,7 +901,7 @@ class HomographyManager:
 
 # --- 5. TEAM IDENTIFIER ---
 class TeamIdentifier:
-    """Efficiently collects crops for a superior HITL experience."""
+    """Efficiently collects crops and automatically assigns Team A/Team B labels."""
     def __init__(self, n_clusters: int):
         self.n_clusters = n_clusters
         self.kmeans = KMeans(n_clusters=n_clusters, n_init='auto', random_state=42)
@@ -1354,6 +1355,33 @@ class PlayerDatabase:
 
             # Example team rosters (in practice, load from external sources)
             self.team_rosters = {
+                'Team A': {
+                    1: 'Goalkeeper_A',
+                    2: 'Defender_A_1',
+                    3: 'Defender_A_2',
+                    4: 'Defender_A_3',
+                    5: 'Defender_A_4',
+                    6: 'Midfielder_A_1',
+                    7: 'Midfielder_A_2',
+                    8: 'Midfielder_A_3',
+                    9: 'Forward_A_1',
+                    10: 'Forward_A_2',
+                    11: 'Forward_A_3'
+                },
+                'Team B': {
+                    1: 'Goalkeeper_B',
+                    2: 'Defender_B_1',
+                    3: 'Defender_B_2',
+                    4: 'Defender_B_3',
+                    5: 'Defender_B_4',
+                    6: 'Midfielder_B_1',
+                    7: 'Midfielder_B_2',
+                    8: 'Midfielder_B_3',
+                    9: 'Forward_B_1',
+                    10: 'Forward_B_2',
+                    11: 'Forward_B_3'
+                },
+                # Keep backward compatibility
                 'Team_A': {
                     1: 'Goalkeeper_A',
                     2: 'Defender_A_1',
@@ -1687,21 +1715,39 @@ class VideoProcessor:
                 self.video_hash = "runtime_upload"
                 return
 
-            self.cap = cv2.VideoCapture(self.config.VIDEO_PATH)
-            if not self.cap.isOpened():
-                raise IOError(f"Cannot open video file: {self.config.VIDEO_PATH}")
+            # Try to open video with better error handling
+            try:
+                self.cap = cv2.VideoCapture(self.config.VIDEO_PATH)
+                if not self.cap.isOpened():
+                    raise IOError(f"Cannot open video file: {self.config.VIDEO_PATH}")
 
-            # Get video properties
-            self.fps = self.cap.get(cv2.CAP_PROP_FPS)
-            self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            self.width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            self.height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                # Get video properties with validation
+                self.fps = self.cap.get(cv2.CAP_PROP_FPS)
+                self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                self.width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                self.height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-            logging.info(f"Video: {self.width}x{self.height}, {self.fps} FPS, {self.total_frames} frames")
+                # Validate video properties
+                if self.fps <= 0:
+                    logging.warning("Invalid FPS detected, using default value of 30")
+                    self.fps = 30
+                if self.total_frames <= 0:
+                    logging.warning("Invalid frame count detected")
+                if self.width <= 0 or self.height <= 0:
+                    logging.warning(f"Invalid video dimensions: {self.width}x{self.height}")
 
-            # Calculate robust video hash
-            self.video_hash = self._calculate_robust_video_hash()
-            self.config.generate_checkpoint_prefix(self.video_hash)
+                logging.info(f"Video: {self.width}x{self.height}, {self.fps} FPS, {self.total_frames} frames")
+
+                # Calculate robust video hash
+                self.video_hash = self._calculate_robust_video_hash()
+                self.config.generate_checkpoint_prefix(self.video_hash)
+
+            except cv2.error as e:
+                logging.error(f"OpenCV error opening video: {e}")
+                raise IOError(f"OpenCV cannot process video file: {self.config.VIDEO_PATH}")
+            except Exception as e:
+                logging.error(f"Unexpected error opening video: {e}")
+                raise
 
         except Exception as e:
             logging.error(f"Video initialization failed: {e}")
@@ -1760,40 +1806,35 @@ class VideoProcessor:
             raise
 
     def _calculate_robust_video_hash(self) -> str:
-        """Hashes frames from start, middle, and end for maximum robustness."""
+        """Hashes video file properties for robustness without reading frames."""
         logging.info("Calculating robust video hash...")
-        
+
         try:
             hasher = hashlib.md5()
-            
-            # Handle edge cases for very short videos
-            if self.total_frames <= 0:
-                # Fallback: use video file stats
+
+            # Use video file properties instead of reading frames to avoid OpenCV issues
+            if self.config.VIDEO_PATH and os.path.exists(self.config.VIDEO_PATH):
+                # Use file stats for hashing
                 stat = os.stat(self.config.VIDEO_PATH)
                 hasher.update(str(stat.st_size).encode())
                 hasher.update(str(stat.st_mtime).encode())
-                return hasher.hexdigest()[:16]
-            
-            # Sample frames intelligently
-            sample_indices = [0]
-            if self.total_frames > 2:
-                sample_indices.append(self.total_frames // 2)
-            if self.total_frames > 1:
-                sample_indices.append(self.total_frames - 1)
-            
-            for idx in sample_indices:
+                hasher.update(self.config.VIDEO_PATH.encode())
+
+                # Add video properties if available
                 if self.cap is not None:
-                    self.cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-                    ret, frame = self.cap.read()
-                    if ret:
-                        # Hash a downsampled version for consistency
-                        small_frame = cv2.resize(frame, (64, 64))
-                        hasher.update(small_frame.tobytes())
-                
-            if self.cap is not None:
-                self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # Rewind for processing
-            return hasher.hexdigest()[:16]
-            
+                    try:
+                        hasher.update(str(self.fps).encode())
+                        hasher.update(str(self.total_frames).encode())
+                        hasher.update(str(self.width).encode())
+                        hasher.update(str(self.height).encode())
+                    except Exception as e:
+                        logging.debug(f"Could not add video properties to hash: {e}")
+
+                return hasher.hexdigest()[:16]
+            else:
+                # Fallback for runtime uploads
+                return hashlib.md5(str(time.time()).encode()).hexdigest()[:16]
+
         except Exception as e:
             logging.error(f"Video hash calculation failed: {e}")
             return hashlib.md5(str(time.time()).encode()).hexdigest()[:16]
@@ -1861,204 +1902,44 @@ class VideoProcessor:
             logging.error(f"State saving failed: {e}")
 
     def _perform_visual_hitl(self) -> None:
-        """A superior HITL experience with a visual montage."""
+        """Automatically assign Team A and Team B labels without human input."""
         try:
-            logging.warning("PAUSING FOR HUMAN INPUT: Please label the teams in the popup window.")
+            logging.info("Automatically assigning team labels...")
 
-            montages = []
             cluster_ids = sorted(self.team_identifier.example_crops.keys())
 
             if not cluster_ids:
-                logging.error("No clusters found for HITL labeling.")
+                logging.error("No clusters found for team assignment.")
                 return
 
-            for cluster_id in cluster_ids:
-                crops = self.team_identifier.example_crops[cluster_id]
-                if not crops:
-                    continue
-
-                try:
-                    # Validate crops before processing
-                    valid_crops = []
-                    for crop in crops[:10]:  # Limit to 10 crops
-                        if crop is not None and crop.size > 0 and len(crop.shape) == 3:
-                            # Ensure crop has valid dimensions
-                            if crop.shape[0] > 0 and crop.shape[1] > 0:
-                                valid_crops.append(crop)
-
-                    if not valid_crops:
-                        continue
-
-                    # Create a grid of crops with better error handling
-                    rows = []
-                    for i in range(0, len(valid_crops), 5):
-                        row_crops = valid_crops[i:i+5]
-                        if len(row_crops) > 0:
-                            try:
-                                # Ensure all crops in row have same height
-                                max_height = max(crop.shape[0] for crop in row_crops)
-                                resized_crops = []
-                                for crop in row_crops:
-                                    if crop.shape[0] != max_height:
-                                        crop = cv2.resize(crop, (crop.shape[1], max_height))
-                                    resized_crops.append(crop)
-
-                                row = cv2.hconcat(resized_crops)
-                                rows.append(row)
-                            except cv2.error as e:
-                                logging.warning(f"Failed to create crop row: {e}")
-                                continue
-
-                    if rows:
-                        try:
-                            # Ensure all rows have same width
-                            max_width = max(row.shape[1] for row in rows)
-                            resized_rows = []
-                            for row in rows:
-                                if row.shape[1] != max_width:
-                                    row = cv2.resize(row, (max_width, row.shape[0]))
-                                resized_rows.append(row)
-
-                            crop_grid = cv2.vconcat(resized_rows)
-
-                            # Add label with error handling
-                            try:
-                                label_img = np.zeros((40, crop_grid.shape[1], 3), dtype=np.uint8)
-                                cv2.putText(label_img, f"Cluster {cluster_id}", (10, 25),
-                                           cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-
-                                montages.append(cv2.vconcat([label_img, crop_grid]))
-                            except cv2.error as e:
-                                logging.warning(f"Failed to add label to crop grid: {e}")
-                                montages.append(crop_grid)
-
-                        except cv2.error as e:
-                            logging.warning(f"Failed to create crop grid: {e}")
-                            continue
-
-                except Exception as e:
-                    logging.warning(f"Failed to process crops for cluster {cluster_id}: {e}")
-                    continue
-
-            if not montages:
-                logging.error("Could not generate HITL montage: no valid example crops were collected.")
-                # Fallback to text-based labeling
-                self._perform_text_hitl(cluster_ids)
-                return
-
-            try:
-                final_montage = cv2.vconcat(montages)
-
-                # Resize if too large
-                if final_montage.shape[0] > 800:
-                    scale = 800 / final_montage.shape[0]
-                    new_width = int(final_montage.shape[1] * scale)
-                    final_montage = cv2.resize(final_montage, (new_width, 800))
-
-                # Try to display the window with error handling
-                try:
-                    # Check if we can create a display window (headless environment check)
-                    import os
-                    if os.environ.get('DISPLAY') is None and os.name != 'nt':
-                        logging.warning("No display available (headless environment), using text-based labeling")
-                        self._perform_text_hitl(cluster_ids)
-                        return
-
-                    # Try to create a test window first to check if display works
-                    test_img = np.zeros((100, 100, 3), dtype=np.uint8)
-                    cv2.imshow("Display Test", test_img)
-                    cv2.waitKey(1)
-                    cv2.destroyWindow("Display Test")
-
-                    # If test succeeds, show the actual window
-                    cv2.imshow("Human-in-the-Loop: Label Teams", final_montage)
-                    cv2.waitKey(100)  # Brief pause to ensure window is displayed
-
-                    print("\n" + "="*60)
-                    print("ACTION REQUIRED: A window named 'Human-in-the-Loop' has opened.")
-                    print("Based on the image, please provide labels for the clusters.")
-                    print("Press any key in the image window after reading, then provide labels.")
-
-                    cv2.waitKey(0)  # Wait for key press
-
-                    user_input = input(f"Enter {len(cluster_ids)} comma-separated labels (e.g., Team A,Team B,Referee): ")
-                    print("="*60 + "\n")
-
-                    cv2.destroyAllWindows()  # More robust cleanup
-
-                except (cv2.error, Exception) as e:
-                    logging.error(f"OpenCV display error: {e}")
-                    # Ensure windows are cleaned up even on error
-                    try:
-                        cv2.destroyAllWindows()
-                    except Exception:
-                        pass
-                    # Fallback to text-based labeling
-                    self._perform_text_hitl(cluster_ids)
-                    return
-
-            except cv2.error as e:
-                logging.error(f"Failed to create final montage: {e}")
-                # Fallback to text-based labeling
-                self._perform_text_hitl(cluster_ids)
-                return
-
-            labels = [label.strip() for label in user_input.split(',')]
-            if len(labels) == len(cluster_ids):
-                self.team_identifier.team_map = {cluster_ids[i]: labels[i] for i in range(len(labels))}
-                logging.info(f"Team labels received and applied: {self.team_identifier.team_map}")
-            else:
-                logging.error(f"Incorrect number of labels ({len(labels)} vs {len(cluster_ids)} actual clusters). Labeling aborted.")
+            # Automatically assign Team A, Team B, etc.
+            self._use_default_labels(cluster_ids)
 
         except Exception as e:
-            logging.error(f"HITL process failed: {e}")
-            # Fallback to text-based labeling
+            logging.error(f"Automatic team assignment failed: {e}")
+            # Fallback to default labeling
             cluster_ids = sorted(self.team_identifier.example_crops.keys())
             if cluster_ids:
-                self._perform_text_hitl(cluster_ids)
-
-    def _perform_text_hitl(self, cluster_ids: List[int]) -> None:
-        """Fallback text-based HITL when visual display fails."""
-        try:
-            print("\n" + "="*60)
-            print("FALLBACK MODE: Visual display failed, using text-based labeling.")
-            print(f"Found {len(cluster_ids)} clusters: {cluster_ids}")
-            print("Please provide labels for each cluster.")
-
-            # Check if we're in an interactive environment
-            import sys
-            if not sys.stdin.isatty():
-                # Non-interactive mode - use default labels
-                logging.warning("Non-interactive environment detected. Using default team labels.")
-                default_labels = [f"Team_{i}" for i in range(len(cluster_ids))]
-                self.team_identifier.team_map = {cluster_ids[i]: default_labels[i] for i in range(len(cluster_ids))}
-                logging.info(f"Default team labels applied: {self.team_identifier.team_map}")
-                return
-
-            try:
-                user_input = input(f"Enter {len(cluster_ids)} comma-separated labels (e.g., Team A,Team B,Referee): ")
-                print("="*60 + "\n")
-
-                labels = [label.strip() for label in user_input.split(',')]
-                if len(labels) == len(cluster_ids):
-                    self.team_identifier.team_map = {cluster_ids[i]: labels[i] for i in range(len(labels))}
-                    logging.info(f"Team labels received and applied: {self.team_identifier.team_map}")
-                else:
-                    logging.error(f"Incorrect number of labels ({len(labels)} vs {len(cluster_ids)} actual clusters). Using defaults.")
-                    self._use_default_labels(cluster_ids)
-
-            except (EOFError, KeyboardInterrupt):
-                logging.warning("User input interrupted. Using default labels.")
                 self._use_default_labels(cluster_ids)
 
+    def _perform_text_hitl(self, cluster_ids: List[int]) -> None:
+        """Automatically assign team labels without human input."""
+        try:
+            logging.info("Automatically assigning team labels...")
+
+            # Always use default labels without human input
+            self._use_default_labels(cluster_ids)
+
         except Exception as e:
-            logging.error(f"Text-based HITL failed: {e}. Using default labels.")
+            logging.error(f"Automatic team assignment failed: {e}")
             self._use_default_labels(cluster_ids)
 
     def _use_default_labels(self, cluster_ids: List[int]) -> None:
-        """Use default labels when user input fails."""
+        """Use default labels with Team A and Team B naming."""
         try:
-            default_labels = [f"Team_{i}" for i in range(len(cluster_ids))]
+            # Use Team A, Team B, Team C, etc. for better readability
+            team_names = ["Team A", "Team B", "Team C", "Team D", "Team E"]
+            default_labels = [team_names[i] if i < len(team_names) else f"Team {chr(65+i)}" for i in range(len(cluster_ids))]
             self.team_identifier.team_map = {cluster_ids[i]: default_labels[i] for i in range(len(cluster_ids))}
             logging.info(f"Default team labels applied: {self.team_identifier.team_map}")
         except Exception as e:
@@ -2128,15 +2009,12 @@ class VideoProcessor:
                         try:
                             self.team_identifier.fit()
                             
-                            # Perform team identification
+                            # Perform team identification - always use automatic labeling
                             if not self.team_identifier.team_map:
-                                if self.config.ENABLE_HITL:
-                                    self._perform_visual_hitl()
-                                else:
-                                    # Use default labels when HITL is disabled
-                                    cluster_ids = sorted(self.team_identifier.example_crops.keys())
-                                    if cluster_ids:
-                                        self._use_default_labels(cluster_ids)
+                                # Always use automatic Team A/Team B labeling
+                                cluster_ids = sorted(self.team_identifier.example_crops.keys())
+                                if cluster_ids:
+                                    self._use_default_labels(cluster_ids)
                         except Exception as e:
                             logging.error(f"Team model fitting failed: {e}")
 
@@ -2178,8 +2056,9 @@ class VideoProcessor:
                     # Fast mode: minimal player analysis
                     for obj in objects:
                         if obj['type'] == 'person':
+                            team_name = "Team A" if obj.get('id', 0) % 2 == 0 else "Team B"
                             obj.update({
-                                'team': f"Team_{obj.get('id', 0) % 2}",  # Simple team assignment
+                                'team': team_name,  # Simple team assignment
                                 'jersey_number': obj.get('id', 0) % 99 + 1,  # Simple jersey assignment
                                 'player_name': f"Player_{obj.get('id', 0)}",
                                 'confidence_score': 0.8  # Default confidence
@@ -2283,11 +2162,20 @@ class VideoProcessor:
                 # Read frame if queue has space
                 if not self.frame_queue.full():
                     if self.cap is not None:
-                        ret, frame = self.cap.read()
-                        if not ret:
-                            logging.info("End of video file reached.")
+                        try:
+                            ret, frame = self.cap.read()
+                            if not ret:
+                                logging.info("End of video file reached.")
+                                self.stop_event.set()
+                                time.sleep(1)  # Give processing thread time to finish
+                                break
+                        except cv2.error as e:
+                            logging.error(f"OpenCV error reading frame: {e}")
                             self.stop_event.set()
-                            time.sleep(1)  # Give processing thread time to finish
+                            break
+                        except Exception as e:
+                            logging.error(f"Unexpected error reading frame: {e}")
+                            self.stop_event.set()
                             break
                     else:
                         logging.error("VideoCapture object is None. Cannot read frames.")
@@ -2317,11 +2205,15 @@ class VideoProcessor:
                 else:
                     time.sleep(0.001)  # Brief pause if queue is full
 
-                # Check for quit signal
-                if cv2.waitKey(1) & 0xFF == ord('q'):
-                    logging.info("'q' pressed, shutting down.")
-                    self.stop_event.set()
-                    break
+                # Check for quit signal (only in non-headless mode)
+                try:
+                    if cv2.waitKey(1) & 0xFF == ord('q'):
+                        logging.info("'q' pressed, shutting down.")
+                        self.stop_event.set()
+                        break
+                except cv2.error:
+                    # Ignore OpenCV errors in headless mode
+                    pass
             
             # Wait for processing to complete
             logging.info("Waiting for processing thread to complete...")
@@ -2680,9 +2572,9 @@ class VideoProcessor:
             for event in events:
                 if event.get('event_type') == 'Shot' and event.get('event_outcome') == 'goal':
                     team = event.get('team', 'unknown')
-                    if team in ['Team_A', 'Cluster 0']:
+                    if team in ['Team A', 'Team_A', 'Cluster 0']:
                         self._game_state['score_team_A'] += 1
-                    elif team in ['Team_B', 'Cluster 1']:
+                    elif team in ['Team B', 'Team_B', 'Cluster 1']:
                         self._game_state['score_team_B'] += 1
 
                     self._game_state['goals_scored'].append({
@@ -2716,7 +2608,7 @@ class VideoProcessor:
 
             # Determine which side of the pitch the team is defending
             # This is a simplified assumption - in reality, this should be determined from game context
-            team_defending_left = team in ['Team_A', 'Cluster 0']  # Assumption
+            team_defending_left = team in ['Team A', 'Team_A', 'Cluster 0']  # Assumption
 
             if team_defending_left:
                 # Team defends left side (x=0), attacks right side (x=pitch_width)
