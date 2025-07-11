@@ -43,6 +43,9 @@ class DashboardServer:
         self.latest_data: Dict[str, Any] = {}
         self.data_queue = queue.Queue(maxsize=100)  # Queue for thread-safe data passing
 
+        # Queue processor task
+        self._queue_processor_task = None
+
         # Simulation state
         self.is_simulating = False
         self.simulation_task = None
@@ -269,7 +272,24 @@ class DashboardServer:
                 "current_video": Path(self.current_video_path).name if self.current_video_path else None,
                 "connections": len(self.active_connections)
             })
-    
+
+        @self.app.on_event("startup")
+        async def startup_event():
+            """Start background tasks when the app starts"""
+            logger.info("Starting dashboard server background tasks")
+            self._queue_processor_task = asyncio.create_task(self._process_data_queue())
+
+        @self.app.on_event("shutdown")
+        async def shutdown_event():
+            """Clean up background tasks when the app shuts down"""
+            logger.info("Shutting down dashboard server background tasks")
+            if self._queue_processor_task is not None:
+                self._queue_processor_task.cancel()
+                try:
+                    await self._queue_processor_task
+                except asyncio.CancelledError:
+                    pass
+
     async def connect(self, websocket: WebSocket):
         """Accept new WebSocket connection"""
         await websocket.accept()
@@ -761,11 +781,13 @@ class DashboardServer:
 
     async def _process_data_queue(self):
         """Background task to process data queue and broadcast to clients"""
+        logger.info("Queue processor started")
         while True:
             try:
                 # Check for new data in queue (non-blocking)
                 try:
                     frame_data = self.data_queue.get_nowait()
+                    logger.debug(f"Processing frame data from queue: frame {frame_data.get('frame_id', 'unknown')}")
                     await self.broadcast_frame_data(frame_data)
                     self.data_queue.task_done()
                 except queue.Empty:
@@ -779,8 +801,7 @@ class DashboardServer:
         """Start the dashboard server"""
         logger.info(f"Starting dashboard server on {self.host}:{self.port}")
 
-        # Start queue processor
-        self._queue_processor_task = asyncio.create_task(self._process_data_queue())
+        # Note: Queue processor is now started via startup event handler
 
         config = uvicorn.Config(
             app=self.app,
@@ -793,13 +814,8 @@ class DashboardServer:
         try:
             await server.serve()
         finally:
-            # Cancel queue processor when server stops
-            if self._queue_processor_task:
-                self._queue_processor_task.cancel()
-                try:
-                    await self._queue_processor_task
-                except asyncio.CancelledError:
-                    pass
+            # Cleanup is now handled by shutdown event handler
+            pass
     
     async def _start_video_processing(self):
         """Start video processing in background thread"""
@@ -828,6 +844,7 @@ class DashboardServer:
             # Set the dashboard server for streaming
             if hasattr(self.video_processor, 'dashboard_server'):
                 self.video_processor.dashboard_server = self
+                logger.info(f"Dashboard server reference set for video processor. Queue available: {hasattr(self, 'data_queue')}")
 
             # Start processing in background thread
             def process_video():

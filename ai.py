@@ -1772,13 +1772,7 @@ class VideoProcessor:
         self.enable_streaming = enable_streaming
         self.dashboard_server = None
         if enable_streaming:
-            try:
-                from dashboard_server import dashboard_server
-                self.dashboard_server = dashboard_server
-                logging.info("Real-time streaming enabled")
-            except ImportError:
-                logging.warning("Dashboard server not available, streaming disabled")
-                self.enable_streaming = False
+            logging.info("Real-time streaming enabled - dashboard server will be set externally")
 
         # Initialize video capture
         self._initialize_video()
@@ -2200,12 +2194,16 @@ class VideoProcessor:
                         # Use a simple queue-based approach to avoid async complexity
                         if hasattr(self.dashboard_server, 'data_queue'):
                             self.dashboard_server.data_queue.put_nowait(frame_result)
+                            if actual_frame_id % 50 == 0:  # Log every 50th frame to avoid spam
+                                logging.info(f"Streamed frame {actual_frame_id} to dashboard queue")
                         else:
                             # Fallback: store latest data for polling
                             self.dashboard_server.latest_data = frame_result
                             self.dashboard_server._update_game_stats(frame_result)
+                            if actual_frame_id % 50 == 0:  # Log every 50th frame to avoid spam
+                                logging.info(f"Updated dashboard data for frame {actual_frame_id} (fallback mode)")
                     except Exception as e:
-                        logging.debug(f"Streaming failed: {e}")  # Use debug level to avoid spam
+                        logging.warning(f"Streaming failed for frame {actual_frame_id}: {e}")
                 
                 # Track performance metrics
                 processing_time = time.time() - start_time
