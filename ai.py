@@ -523,7 +523,7 @@ class ObjectTracker:
 # --- 4. HOMOGRAPHY MANAGER ---
 class HomographyManager:
     """Manages homography with correct reprojection error calculation."""
-    def __init__(self, pitch_dims: Tuple[int, int], segmentation_model: SegmentationModel):
+    def __init__(self, pitch_dims: Tuple[float, float], segmentation_model: SegmentationModel):
         self.pitch_dims = pitch_dims
         self.segmentation_model = segmentation_model
         self.homography_matrix = None
@@ -1014,7 +1014,7 @@ class TeamIdentifier:
                     crop_resized = cv2.resize(crop_bgr, (64, 64))
                     self.crop_samples.append(crop_resized)
                     # If already fitted, update example crops
-                    if self.is_fitted:
+                    if self.is_fitted and self.kmeans is not None:
                         cluster_id = self.kmeans.predict([features])[0]
                         max_crops = Config.MODEL_PARAMS['MAX_CROPS_PER_CLUSTER']
                         if len(self.example_crops[cluster_id]) < max_crops:
@@ -1026,50 +1026,76 @@ class TeamIdentifier:
                 logging.error(f"Crop storage failed: {e}")
 
     def fit(self) -> None:
-        """Fits the K-Means model and organizes crops by cluster."""
+        """Fits the K-Means model and organizes crops by cluster with improved stability."""
         if len(self.feature_samples) < self.n_clusters:
             logging.warning(f"Not enough samples ({len(self.feature_samples)}) for {self.n_clusters} clusters")
             return
-            
+
         try:
             logging.info("Fitting team feature model...")
-            self.kmeans.fit(self.feature_samples)
+
+            # FIXED: Improve clustering stability with multiple runs
+            best_inertia = float('inf')
+            best_kmeans = None
+
+            # Try multiple random initializations to find the most stable clustering
+            for attempt in range(5):  # Try 5 different initializations
+                temp_kmeans = KMeans(
+                    n_clusters=self.n_clusters,
+                    n_init=10,  # Multiple initializations per attempt
+                    random_state=42 + attempt,  # Different seed each time
+                    max_iter=300
+                )
+                temp_kmeans.fit(self.feature_samples)
+
+                if temp_kmeans.inertia_ < best_inertia:
+                    best_inertia = temp_kmeans.inertia_
+                    best_kmeans = temp_kmeans
+
+            self.kmeans = best_kmeans
             self.is_fitted = True
-            
+
             # Clear existing example crops
             self.example_crops.clear()
-            
+
             # Organize existing crops by cluster
             for i, features in enumerate(self.feature_samples):
-                if i < len(self.crop_samples):
+                if i < len(self.crop_samples) and self.kmeans is not None:
                     cluster_id = self.kmeans.predict([features])[0]
                     max_crops = Config.MODEL_PARAMS['MAX_CROPS_PER_CLUSTER']
                     if len(self.example_crops[cluster_id]) < max_crops:
                         self.example_crops[cluster_id].append(self.crop_samples[i])
-                        
+
+            # FIXED: Validate clustering quality
+            cluster_sizes = [len(self.example_crops[i]) for i in range(self.n_clusters)]
             logging.info(f"Team K-Means model fitted with {len(self.feature_samples)} samples.")
-            
+            logging.info(f"Cluster sizes: {cluster_sizes}, Inertia: {best_inertia:.2f}")
+
+            # Warn if clusters are very unbalanced
+            if max(cluster_sizes) > 3 * min(cluster_sizes):
+                logging.warning("Unbalanced clusters detected - team identification may be less accurate")
+
         except Exception as e:
             logging.error(f"Model fitting failed: {e}")
             self.is_fitted = False
 
     def classify_player(self, frame: np.ndarray, bbox: List[int]) -> str:
         """Classifies a single player based on the fitted model and labeled map."""
-        if not self.is_fitted:
+        if not self.is_fitted or self.kmeans is None:
             return "Unknown"
-        
+
         try:
             features = self._extract_player_features(frame, bbox)
             if features is None:
                 return "Unknown"
-            
+
             pred_cluster = self.kmeans.predict([features])[0]
-            
+
             if self.team_map:
                 return self.team_map.get(pred_cluster, f"Cluster {pred_cluster}")
             else:
                 return f"Cluster {pred_cluster}"
-                
+
         except Exception as e:
             logging.error(f"Player classification failed: {e}")
             return "Unknown"
@@ -1280,21 +1306,33 @@ class JerseyNumberDetector:
             # Run OCR
             results = self.ocr_reader.readtext(processed_crop)
 
-            # Extract numbers from OCR results
+            # FIXED: Improved number extraction and validation
+            detected_numbers = []
             for (_, text, confidence) in results:  # bbox not needed for this implementation
                 try:
                     conf_value = float(confidence)
                 except (ValueError, TypeError):
                     conf_value = 0.0
+
                 if conf_value > self.ocr_confidence_threshold:
-                    # Extract numeric characters
-                    numeric_text = ''.join(filter(str.isdigit, text))
+                    # Extract numeric characters with better filtering
+                    numeric_text = ''.join(filter(str.isdigit, text.strip()))
                     if numeric_text:
-                        number = int(numeric_text)
-                        # Validate jersey number range (typically 1-99)
-                        if 1 <= number <= 99:
-                            logging.debug(f"Detected jersey number: {number} (confidence: {conf_value:.2f})")
-                            return number
+                        try:
+                            number = int(numeric_text)
+                            # Validate jersey number range (typically 1-99)
+                            if 1 <= number <= 99:
+                                detected_numbers.append((number, conf_value))
+                                logging.debug(f"Detected jersey number candidate: {number} (confidence: {conf_value:.2f})")
+                        except ValueError:
+                            continue
+
+            # Return the number with highest confidence if multiple detected
+            if detected_numbers:
+                detected_numbers.sort(key=lambda x: x[1], reverse=True)  # Sort by confidence
+                best_number, best_confidence = detected_numbers[0]
+                logging.debug(f"Selected jersey number: {best_number} (confidence: {best_confidence:.2f})")
+                return best_number
 
             return 0
 
@@ -1770,7 +1808,7 @@ class VideoProcessor:
 
         # Real-time streaming support
         self.enable_streaming = enable_streaming
-        self.dashboard_server = None
+        self.dashboard_server: Optional[Any] = None
         if enable_streaming:
             logging.info("Real-time streaming enabled - dashboard server will be set externally")
 
@@ -1875,8 +1913,10 @@ class VideoProcessor:
         """Initialize all processing components."""
         try:
             self.segmentation_model = SegmentationModel(self.config.SEGMENTATION_MODEL_PATH)
+            # FIXED: Use correct pitch dimensions in meters (105m x 68m standard football pitch)
+            # Previous: (1050, 680) was incorrectly treating centimeters as meters
             self.homography_manager = HomographyManager(
-                pitch_dims=(1050, 680),
+                pitch_dims=(105.0, 68.0),  # Standard football pitch in meters
                 segmentation_model=self.segmentation_model
             )
             self.team_identifier = TeamIdentifier(self.config.MODEL_PARAMS['TEAM_N_CLUSTERS'])
@@ -2088,9 +2128,20 @@ class VideoProcessor:
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
                 
-                # Object tracking with error recovery
+                # Object tracking with error recovery and validation
                 try:
                     objects = self.object_tracker.track_objects(frame)
+
+                    # FIXED: Validate tracking results to catch data corruption early
+                    validated_objects = []
+                    for obj in objects:
+                        if self._validate_object_data(obj, actual_frame_id):
+                            validated_objects.append(obj)
+                        else:
+                            logging.warning(f"Invalid object data detected for frame {actual_frame_id}, object {obj.get('id', 'unknown')}")
+
+                    objects = validated_objects
+
                 except Exception as e:
                     logging.error(f"Object tracking failed for frame {actual_frame_id}: {e}")
                     objects = []
@@ -2326,19 +2377,327 @@ class VideoProcessor:
         """Saves state and exports data upon completion."""
         try:
             logging.info("Cleaning up, saving state, and exporting data...")
-            
+
             # Release resources
             if self.cap:
                 self.cap.release()
             cv2.destroyAllWindows()
-            
+
             # Save state
             self.save_state()
 
-
+            # FIXED: Actually export analytics data (was missing!)
+            self.export_analytics()
 
         except Exception as e:
             logging.error(f"Cleanup failed: {e}")
+
+    def export_analytics(self) -> None:
+        """Export comprehensive analytics to CSV and JSON formats."""
+        try:
+            logging.info("Exporting analytics data...")
+
+            if not self.results_data:
+                logging.warning("No results data to export")
+                return
+
+            # Generate comprehensive analytics
+            analytics = self._generate_comprehensive_analytics()
+
+            # Export to CSV
+            self._export_to_csv(analytics)
+
+            # Export to JSON for dashboard compatibility
+            self._export_to_json(analytics)
+
+            logging.info(f"Analytics exported successfully to {self.config.OUTPUT_CSV_PATH}")
+
+        except Exception as e:
+            logging.error(f"Analytics export failed: {e}")
+
+    def _generate_comprehensive_analytics(self) -> Dict[str, Any]:
+        """Generate comprehensive analytics from processed frame data."""
+        try:
+            analytics = {
+                'game_summary': {
+                    'total_frames': len(self.results_data),
+                    'duration_seconds': len(self.results_data) / self.fps if self.fps > 0 else 0,
+                    'fps': self.fps,
+                    'video_resolution': f"{self.width}x{self.height}",
+                    'pitch_dimensions': f"{self.homography_manager.pitch_dims[0]}x{self.homography_manager.pitch_dims[1]}m"
+                },
+                'team_stats': {},
+                'player_stats': {},
+                'events': [],
+                'possession_stats': {'team_A': 0, 'team_B': 0, 'none': 0},
+                'performance_metrics': self.performance_metrics.copy()
+            }
+
+            # Process all frame data to generate statistics
+            for frame_data in self.results_data:
+                self._process_frame_for_analytics(frame_data, analytics)
+
+            # Calculate final aggregated statistics
+            self._calculate_final_statistics(analytics)
+
+            return analytics
+
+        except Exception as e:
+            logging.error(f"Analytics generation failed: {e}")
+            return {}
+
+    def _process_frame_for_analytics(self, frame_data: Dict[str, Any], analytics: Dict[str, Any]) -> None:
+        """Process individual frame data to accumulate analytics."""
+        try:
+            objects = frame_data.get('objects', [])
+            _ = frame_data.get('actions', {})
+
+            # Process players
+            for obj in objects:
+                if obj.get('type') == 'person':
+                    player_id = obj.get('id')
+                    team = obj.get('team', 'Unknown')
+
+                    # Initialize team stats
+                    if team not in analytics['team_stats']:
+                        analytics['team_stats'][team] = {
+                            'total_players': set(),
+                            'total_distance': 0.0,
+                            'total_speed_samples': [],
+                            'ball_touches': 0,
+                            'events': []
+                        }
+
+                    # Initialize player stats
+                    if player_id not in analytics['player_stats']:
+                        analytics['player_stats'][player_id] = {
+                            'team': team,
+                            'jersey_number': obj.get('jersey_number', 0),
+                            'player_name': obj.get('player_name', f'Player_{player_id}'),
+                            'total_distance': 0.0,
+                            'max_speed': 0.0,
+                            'speed_samples': [],
+                            'ball_touches': 0,
+                            'positions': []
+                        }
+
+                    # Update player statistics
+                    player_stats = analytics['player_stats'][player_id]
+                    team_stats = analytics['team_stats'][team]
+
+                    # Add player to team
+                    team_stats['total_players'].add(player_id)
+
+                    # Track position
+                    pos_pitch = obj.get('pos_pitch', [0, 0])
+                    if len(pos_pitch) >= 2:
+                        player_stats['positions'].append(pos_pitch)
+
+                        # Calculate distance if we have previous position
+                        if len(player_stats['positions']) >= 2:
+                            prev_pos = player_stats['positions'][-2]
+                            distance = ((pos_pitch[0] - prev_pos[0])**2 + (pos_pitch[1] - prev_pos[1])**2)**0.5
+                            player_stats['total_distance'] += distance
+                            team_stats['total_distance'] += distance
+
+                    # Track speed
+                    speed_str = obj.get('player_speed_kmh', '')
+                    if speed_str and speed_str != '':
+                        try:
+                            speed = float(speed_str)
+                            player_stats['speed_samples'].append(speed)
+                            team_stats['total_speed_samples'].append(speed)
+                            player_stats['max_speed'] = max(player_stats['max_speed'], speed)
+                        except (ValueError, TypeError):
+                            pass
+
+            # Process events
+            events = frame_data.get('events', [])
+            for event in events:
+                analytics['events'].append({
+                    'timestamp': frame_data.get('timestamp', 0),
+                    'frame_id': frame_data.get('frame_id', 0),
+                    'event_type': event.get('type', ''),
+                    'player_id': event.get('player_id', ''),
+                    'team': event.get('team', ''),
+                    'success': event.get('success', False)
+                })
+
+        except Exception as e:
+            logging.warning(f"Frame analytics processing failed: {e}")
+
+    def _calculate_final_statistics(self, analytics: Dict[str, Any]) -> None:
+        """Calculate final aggregated statistics."""
+        try:
+            # Calculate team averages
+            for team, stats in analytics['team_stats'].items():
+                player_count = len(stats['total_players'])
+                if player_count > 0:
+                    stats['average_distance_per_player'] = stats['total_distance'] / player_count
+                    if stats['total_speed_samples']:
+                        stats['average_speed'] = sum(stats['total_speed_samples']) / len(stats['total_speed_samples'])
+                        stats['max_speed'] = max(stats['total_speed_samples'])
+                    else:
+                        stats['average_speed'] = 0.0
+                        stats['max_speed'] = 0.0
+
+                # Convert set to count
+                stats['total_players'] = player_count
+
+            # Calculate player averages
+            for player_id, stats in analytics['player_stats'].items():
+                if stats['speed_samples']:
+                    stats['average_speed'] = sum(stats['speed_samples']) / len(stats['speed_samples'])
+                else:
+                    stats['average_speed'] = 0.0
+
+                # Remove raw data to reduce size
+                del stats['speed_samples']
+                del stats['positions']
+
+        except Exception as e:
+            logging.warning(f"Final statistics calculation failed: {e}")
+
+    def _export_to_csv(self, analytics: Dict[str, Any]) -> None:
+        """Export analytics to CSV format."""
+        try:
+            import csv
+
+            # Export player statistics
+            csv_path = self.config.OUTPUT_CSV_PATH
+            with open(csv_path, 'w', newline='', encoding='utf-8') as csvfile:
+                fieldnames = [
+                    'player_id', 'team', 'jersey_number', 'player_name',
+                    'total_distance_m', 'average_speed_kmh', 'max_speed_kmh'
+                ]
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                writer.writeheader()
+
+                for player_id, stats in analytics['player_stats'].items():
+                    writer.writerow({
+                        'player_id': player_id,
+                        'team': stats.get('team', 'Unknown'),
+                        'jersey_number': stats.get('jersey_number', 0),
+                        'player_name': stats.get('player_name', f'Player_{player_id}'),
+                        'total_distance_m': round(stats.get('total_distance', 0.0), 2),
+                        'average_speed_kmh': round(stats.get('average_speed', 0.0), 2),
+                        'max_speed_kmh': round(stats.get('max_speed', 0.0), 2)
+                    })
+
+            logging.info(f"Player statistics exported to {csv_path}")
+
+        except Exception as e:
+            logging.error(f"CSV export failed: {e}")
+
+    def _export_to_json(self, analytics: Dict[str, Any]) -> None:
+        """Export analytics to JSON format for dashboard compatibility."""
+        try:
+            json_path = self.config.OUTPUT_CSV_PATH.replace('.csv', '_analytics.json')
+
+            # Create dashboard-compatible format
+            dashboard_data = {
+                'game_summary': analytics['game_summary'],
+                'team_stats': {},
+                'player_stats': analytics['player_stats'],
+                'events': analytics['events'][-100:],  # Last 100 events
+                'total_events': len(analytics['events'])
+            }
+
+            # Convert team stats to dashboard format
+            for team, stats in analytics['team_stats'].items():
+                dashboard_data['team_stats'][team] = {
+                    'total_players': stats.get('total_players', 0),
+                    'total_distance': round(stats.get('total_distance', 0.0), 2),
+                    'average_distance_per_player': round(stats.get('average_distance_per_player', 0.0), 2),
+                    'average_speed': round(stats.get('average_speed', 0.0), 2),
+                    'max_speed': round(stats.get('max_speed', 0.0), 2)
+                }
+
+            with open(json_path, 'w', encoding='utf-8') as jsonfile:
+                json.dump(dashboard_data, jsonfile, indent=2, ensure_ascii=False)
+
+            logging.info(f"Analytics JSON exported to {json_path}")
+
+        except Exception as e:
+            logging.error(f"JSON export failed: {e}")
+
+    def _validate_object_data(self, obj: Dict[str, Any], frame_id: int) -> bool:
+        """Validate object data to catch corruption early and prevent incorrect analytics."""
+        try:
+            # Check required fields
+            required_fields = ['id', 'type', 'bbox_video', 'confidence']
+            for field in required_fields:
+                if field not in obj:
+                    logging.debug(f"Missing required field '{field}' in object data")
+                    return False
+
+            # Validate object ID
+            obj_id = obj.get('id')
+            if not isinstance(obj_id, (int, str)) or obj_id == '':
+                logging.debug(f"Invalid object ID: {obj_id}")
+                return False
+
+            # Validate bounding box
+            bbox = obj.get('bbox_video', [])
+            if not isinstance(bbox, list) or len(bbox) != 4:
+                logging.debug(f"Invalid bbox format: {bbox}")
+                return False
+
+            try:
+                x1, y1, x2, y2 = [float(x) for x in bbox]
+                if x1 >= x2 or y1 >= y2 or x1 < 0 or y1 < 0:
+                    logging.debug(f"Invalid bbox coordinates: {bbox}")
+                    return False
+            except (ValueError, TypeError):
+                logging.debug(f"Non-numeric bbox values: {bbox}")
+                return False
+
+            # Validate confidence
+            confidence = obj.get('confidence', 0)
+            try:
+                conf_val = float(confidence)
+                if not (0.0 <= conf_val <= 1.0):
+                    logging.debug(f"Confidence out of range [0,1]: {conf_val}")
+                    return False
+            except (ValueError, TypeError):
+                logging.debug(f"Invalid confidence value: {confidence}")
+                return False
+
+            # Validate pitch coordinates if present
+            pos_pitch = obj.get('pos_pitch')
+            if pos_pitch is not None:
+                if not isinstance(pos_pitch, list) or len(pos_pitch) != 2:
+                    logging.debug(f"Invalid pos_pitch format: {pos_pitch}")
+                    return False
+
+                try:
+                    x, y = [float(coord) for coord in pos_pitch]
+                    # Check if coordinates are within reasonable pitch bounds
+                    pitch_width, pitch_height = self.homography_manager.pitch_dims
+                    if not (-10 <= x <= pitch_width + 10 and -10 <= y <= pitch_height + 10):
+                        logging.debug(f"Pitch coordinates out of bounds: {pos_pitch}")
+                        return False
+                except (ValueError, TypeError):
+                    logging.debug(f"Non-numeric pitch coordinates: {pos_pitch}")
+                    return False
+
+            # Validate speed if present
+            speed = obj.get('player_speed_kmh')
+            if speed is not None and speed != '':
+                try:
+                    speed_val = float(speed)
+                    if speed_val < 0 or speed_val > 50:  # Reasonable human speed limits
+                        logging.debug(f"Speed out of reasonable range: {speed_val} km/h")
+                        return False
+                except (ValueError, TypeError):
+                    logging.debug(f"Invalid speed value: {speed}")
+                    return False
+
+            return True
+
+        except Exception as e:
+            logging.warning(f"Object validation failed: {e}")
+            return False
 
 
     def _assign_jersey_number(self, obj_id: int, team_name: str) -> int:
@@ -2487,21 +2846,28 @@ class VideoProcessor:
             return 'unknown'
 
     def _calculate_player_speed(self, obj: Dict[str, Any], frame_data: Dict[str, Any]) -> str:
-        """Calculate player speed in km/h using proper coordinate system and frame rate."""
+        """Calculate player speed in km/h using proper coordinate system and frame rate.
+
+        FIXED: Accounts for frame skipping, correct coordinate system, and proper time calculation.
+        """
         try:
             # Get tracking history for this object
             obj_id = obj.get('id', -1)
             if obj_id in self.object_tracker.tracking_history:
                 history = self.object_tracker.tracking_history[obj_id]
                 if len(history) >= 2:
-                    # Get current and previous positions in pitch coordinates
+                    # Get current position in pitch coordinates
                     current_pos = obj.get('pos_pitch', [0, 0])
+                    current_time = time.time()
 
-                    # Find previous position in pitch coordinates from history
+                    # Find the most recent previous position with timestamp
                     prev_pos = None
+                    prev_time = None
+
                     for i in range(len(history) - 2, -1, -1):  # Go backwards through history
                         prev_entry = history[i]
                         prev_bbox = prev_entry.get('bbox', [0, 0, 0, 0])
+                        entry_timestamp = prev_entry.get('timestamp', 0)
 
                         # Convert previous bbox to pitch coordinates using homography
                         if self.homography_manager.homography_matrix is not None:
@@ -2515,12 +2881,14 @@ class VideoProcessor:
                                     video_point, self.homography_manager.homography_matrix
                                 )
                                 prev_pos = pitch_point.flatten().tolist()
+                                prev_time = entry_timestamp
                                 break
                             except Exception:
                                 continue
                         else:
-                            # Fallback: use simple scaling if no homography
-                            video_width, video_height = 1920, 1080  # Default assumption
+                            # FIXED: Get actual video dimensions instead of hardcoded values
+                            video_width = getattr(self, 'width', 1920)
+                            video_height = getattr(self, 'height', 1080)
                             pitch_width, pitch_height = self.homography_manager.pitch_dims
 
                             x_center = (prev_bbox[0] + prev_bbox[2]) / 2
@@ -2530,25 +2898,39 @@ class VideoProcessor:
                                 (x_center / video_width) * pitch_width,
                                 (y_bottom / video_height) * pitch_height
                             ]
+                            prev_time = entry_timestamp
                             break
 
-                    if current_pos and prev_pos and len(current_pos) >= 2 and len(prev_pos) >= 2:
-                        # Calculate distance in meters (pitch coordinates should be in meters)
+                    if (current_pos and prev_pos and len(current_pos) >= 2 and len(prev_pos) >= 2
+                        and prev_time and prev_time > 0):
+
+                        # FIXED: Calculate distance in meters (coordinates are now correctly in meters)
                         distance = ((current_pos[0] - prev_pos[0])**2 + (current_pos[1] - prev_pos[1])**2)**0.5
 
-                        # Use actual video frame rate instead of hardcoded value
-                        fps = self.fps if hasattr(self, 'fps') and self.fps > 0 else 30.0
-                        time_diff = 1.0 / fps  # seconds between frames
+                        # FIXED: Use actual time difference instead of assuming consecutive frames
+                        time_diff = current_time - prev_time
+
+                        # Fallback to frame-based calculation if timestamps are invalid
+                        if time_diff <= 0 or time_diff > 5.0:  # Sanity check: max 5 seconds
+                            fps = self.fps if hasattr(self, 'fps') and self.fps > 0 else 30.0
+                            # FIXED: Account for frame skipping interval
+                            frame_skip_interval = getattr(self.config, 'MODEL_PARAMS', {}).get('FRAME_SKIP_INTERVAL', 2)
+                            time_diff = frame_skip_interval / fps
 
                         # Calculate speed
-                        speed_ms = distance / time_diff  # m/s
-                        speed_kmh = speed_ms * 3.6  # km/h
+                        if time_diff > 0:
+                            speed_ms = distance / time_diff  # m/s
+                            speed_kmh = speed_ms * 3.6  # km/h
 
-                        # Apply reasonable limits (human running speed typically 0-40 km/h)
-                        if speed_kmh > 50.0:  # Likely tracking error
-                            return ""
+                            # FIXED: Apply more reasonable limits for human running speed
+                            if speed_kmh > 40.0:  # Professional athletes rarely exceed 40 km/h
+                                return ""
 
-                        return f"{speed_kmh:.1f}"
+                            # Filter out unrealistically low speeds (likely noise)
+                            if speed_kmh < 0.5:
+                                return ""
+
+                            return f"{speed_kmh:.1f}"
 
             return ""
 
@@ -2557,21 +2939,28 @@ class VideoProcessor:
             return ""
 
     def _calculate_ball_speed(self, obj: Dict[str, Any], frame_data: Dict[str, Any]) -> str:
-        """Calculate ball speed in km/h using proper coordinate system and frame rate."""
+        """Calculate ball speed in km/h using proper coordinate system and frame rate.
+
+        FIXED: Accounts for frame skipping, correct coordinate system, and proper time calculation.
+        """
         try:
             # Get tracking history for this object
             obj_id = obj.get('id', -1)
             if obj_id in self.object_tracker.tracking_history:
                 history = self.object_tracker.tracking_history[obj_id]
                 if len(history) >= 2:
-                    # Get current and previous positions in pitch coordinates
+                    # Get current position in pitch coordinates
                     current_pos = obj.get('pos_pitch', [0, 0])
+                    current_time = time.time()
 
-                    # Find previous position in pitch coordinates from history
+                    # Find the most recent previous position with timestamp
                     prev_pos = None
+                    prev_time = None
+
                     for i in range(len(history) - 2, -1, -1):  # Go backwards through history
                         prev_entry = history[i]
                         prev_bbox = prev_entry.get('bbox', [0, 0, 0, 0])
+                        entry_timestamp = prev_entry.get('timestamp', 0)
 
                         # Convert previous bbox to pitch coordinates using homography
                         if self.homography_manager.homography_matrix is not None:
@@ -2585,12 +2974,14 @@ class VideoProcessor:
                                     video_point, self.homography_manager.homography_matrix
                                 )
                                 prev_pos = pitch_point.flatten().tolist()
+                                prev_time = entry_timestamp
                                 break
                             except Exception:
                                 continue
                         else:
-                            # Fallback: use simple scaling if no homography
-                            video_width, video_height = 1920, 1080  # Default assumption
+                            # FIXED: Get actual video dimensions instead of hardcoded values
+                            video_width = getattr(self, 'width', 1920)
+                            video_height = getattr(self, 'height', 1080)
                             pitch_width, pitch_height = self.homography_manager.pitch_dims
 
                             x_center = (prev_bbox[0] + prev_bbox[2]) / 2
@@ -2600,25 +2991,39 @@ class VideoProcessor:
                                 (x_center / video_width) * pitch_width,
                                 (y_center / video_height) * pitch_height
                             ]
+                            prev_time = entry_timestamp
                             break
 
-                    if current_pos and prev_pos and len(current_pos) >= 2 and len(prev_pos) >= 2:
-                        # Calculate distance in meters
+                    if (current_pos and prev_pos and len(current_pos) >= 2 and len(prev_pos) >= 2
+                        and prev_time and prev_time > 0):
+
+                        # FIXED: Calculate distance in meters (coordinates are now correctly in meters)
                         distance = ((current_pos[0] - prev_pos[0])**2 + (current_pos[1] - prev_pos[1])**2)**0.5
 
-                        # Use actual video frame rate
-                        fps = self.fps if hasattr(self, 'fps') and self.fps > 0 else 30.0
-                        time_diff = 1.0 / fps  # seconds between frames
+                        # FIXED: Use actual time difference instead of assuming consecutive frames
+                        time_diff = current_time - prev_time
+
+                        # Fallback to frame-based calculation if timestamps are invalid
+                        if time_diff <= 0 or time_diff > 5.0:  # Sanity check: max 5 seconds
+                            fps = self.fps if hasattr(self, 'fps') and self.fps > 0 else 30.0
+                            # FIXED: Account for frame skipping interval
+                            frame_skip_interval = getattr(self.config, 'MODEL_PARAMS', {}).get('FRAME_SKIP_INTERVAL', 2)
+                            time_diff = frame_skip_interval / fps
 
                         # Calculate speed
-                        speed_ms = distance / time_diff  # m/s
-                        speed_kmh = speed_ms * 3.6  # km/h
+                        if time_diff > 0:
+                            speed_ms = distance / time_diff  # m/s
+                            speed_kmh = speed_ms * 3.6  # km/h
 
-                        # Apply reasonable limits for ball speed (0-200 km/h for soccer)
-                        if speed_kmh > 200.0:  # Likely tracking error
-                            return ""
+                            # FIXED: Apply more realistic limits for ball speed in soccer
+                            if speed_kmh > 120.0:  # Professional soccer ball rarely exceeds 120 km/h
+                                return ""
 
-                        return f"{speed_kmh:.1f}"
+                            # Filter out unrealistically low speeds (likely noise)
+                            if speed_kmh < 1.0:
+                                return ""
+
+                            return f"{speed_kmh:.1f}"
 
             return ""
 
@@ -2667,8 +3072,9 @@ class VideoProcessor:
                     player1, dist1 = nearby_players[0]
                     player2, dist2 = nearby_players[1]
 
-                    # Check if players are from different teams (indicating a pass)
-                    if player1.get('team') == player2.get('team') and dist1 < 2.0:
+                    # FIXED: Check if players are from SAME team (indicating a pass between teammates)
+                    # Previous logic was incorrect - passes happen between same team players
+                    if player1.get('team') == player2.get('team') and dist1 < 2.0 and dist2 < 3.0:
                         event_type = "Pass"
                         event_outcome = "successful"
                         pass_recipient_id = str(player2.get('id', ''))

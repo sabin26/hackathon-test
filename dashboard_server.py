@@ -617,9 +617,21 @@ class DashboardServer:
         """Update team-level aggregate statistics from individual player stats"""
         try:
             for team_key in ["team_A", "team_B"]:
+                # FIXED: Standardize team name mapping for consistent analytics
+                def normalize_team_name(team_name: str) -> str:
+                    """Normalize various team name formats to standard team_A/team_B"""
+                    if not team_name:
+                        return ""
+                    team_lower = team_name.lower().strip()
+                    if team_lower in ["team a", "team_a", "cluster 0", "cluster_0"]:
+                        return "team_A"
+                    elif team_lower in ["team b", "team_b", "cluster 1", "cluster_1"]:
+                        return "team_B"
+                    return team_name
+
                 team_players = [
                     player_stat for player_id, player_stat in self.game_stats["player_stats"].items()
-                    if player_stat.get("team", "").replace("Team A", "team_A").replace("Team B", "team_B").replace("Team_", "team_").replace("Cluster 0", "team_A").replace("Cluster 1", "team_B") == team_key
+                    if normalize_team_name(player_stat.get("team", "")) == team_key
                 ]
 
                 if team_players:
