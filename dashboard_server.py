@@ -285,10 +285,6 @@ class DashboardServer:
             logger.info("Shutting down dashboard server background tasks")
             if self._queue_processor_task is not None:
                 self._queue_processor_task.cancel()
-                try:
-                    await self._queue_processor_task
-                except asyncio.CancelledError:
-                    pass
 
     async def connect(self, websocket: WebSocket):
         """Accept new WebSocket connection"""
@@ -841,8 +837,8 @@ class DashboardServer:
             if self.current_video_path:
                 self.video_processor.set_video_path(self.current_video_path)
 
-            # Set the dashboard server for streaming
-            if hasattr(self.video_processor, 'dashboard_server'):
+            # Set the dashboard server for streaming only if attribute is not strictly None and not type None
+            if hasattr(self.video_processor, 'dashboard_server') and self.video_processor.dashboard_server is None:
                 self.video_processor.dashboard_server = self
                 logger.info(f"Dashboard server reference set for video processor. Queue available: {hasattr(self, 'data_queue')}")
 
@@ -918,8 +914,6 @@ class DashboardServer:
 
     async def _simulation_loop(self):
         """Main simulation loop that generates realistic analytics data"""
-        import random
-        import math
 
         frame_count = 0
         game_time = 0
@@ -1094,7 +1088,7 @@ class DashboardServer:
             speed_kmh = math.sqrt(dx*dx + dy*dy) * 30 * 3.6  # Convert to km/h
             speed_kmh = max(0, min(35, speed_kmh))  # Cap at realistic max speed
 
-            # Generate realistic player data
+            # Generate realistic player data matching real video processing output
             player = {
                 "id": player_id,
                 "type": "person",
@@ -1102,14 +1096,22 @@ class DashboardServer:
                     int(x * 10), int(y * 10),
                     int(x * 10) + 20, int(y * 10) + 40
                 ],
+                "bbox_video": [  # Add bbox_video field that real processing includes
+                    int(x * 10), int(y * 10),
+                    int(x * 10) + 20, int(y * 10) + 40
+                ],
                 "confidence": random.uniform(0.85, 0.98),
                 "pos_pitch": [x, y],
                 "team_name": team,
+                "team": team,  # Add 'team' field (both team_name and team are used)
                 "jersey_number": str((i % 11) + 1),
                 "player_name": f"Player {(i % 11) + 1}",
                 "player_speed_kmh": speed_kmh,
                 "distance_covered_m": math.sqrt(dx*dx + dy*dy),
-                "ball_possession": False
+                "ball_possession": False,
+                "confidence_score": random.uniform(0.7, 0.95),  # Add confidence_score field
+                "detection_count": random.randint(5, 20),  # Add detection_count field
+                "tracking_quality": random.uniform(0.8, 1.0)  # Add tracking_quality field
             }
             players.append(player)
 
@@ -1135,8 +1137,10 @@ class DashboardServer:
             "id": "ball_1",
             "type": "sports ball",
             "bbox": [int(ball_x * 10), int(ball_y * 10), int(ball_x * 10) + 10, int(ball_y * 10) + 10],
+            "bbox_video": [int(ball_x * 10), int(ball_y * 10), int(ball_x * 10) + 10, int(ball_y * 10) + 10],  # Add bbox_video field
             "confidence": random.uniform(0.90, 0.99),
-            "pos_pitch": [ball_x, ball_y]
+            "pos_pitch": [ball_x, ball_y],
+            "tracking_quality": random.uniform(0.85, 1.0)  # Add tracking_quality field
         }
 
         # Assign ball possession to nearest player
@@ -1215,9 +1219,10 @@ class DashboardServer:
         processing_time = random.uniform(0.020, 0.080)  # 20-80ms realistic processing time
 
         return {
+            "frame_id": frame_count,  # Changed from frame_number to match real video processing
             "timestamp": game_time,
-            "frame_number": frame_count,
             "objects": players + [ball],
+            "actions": {},  # Add actions field to match real video processing
             "events": events,
             "field_dimensions": [field_width, field_height],
             "possession_team": state['current_possession_team'],

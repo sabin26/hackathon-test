@@ -765,6 +765,22 @@ class SportsAnalyticsDashboard {
 		this.updateHeatZonesChart(eventAnalytics.heat_zones || {})
 	}
 
+	updateStats(stats) {
+		// Update only the statistics without frame data
+		// This is called when we receive stats-only updates
+		this.gameStats = stats
+		this.updateGameOverview(stats)
+		this.updatePossessionChart(stats)
+		this.updateHeatmap(stats)
+		this.updateEvents(stats)
+		this.updatePerformanceMetrics(stats)
+		this.updateTimeline(stats)
+		this.updateTeamStats(stats)
+		this.updateGameFlow(stats)
+		this.updatePlayerStats(stats)
+		this.updateEventAnalytics(stats)
+	}
+
 	updateEventFrequencyChart(eventFrequency) {
 		const chartElement = document.getElementById('event-frequency-chart')
 		if (!chartElement) return
