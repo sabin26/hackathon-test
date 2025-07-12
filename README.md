@@ -55,7 +55,9 @@ The system is built with a clean, modular architecture:
     ```bash
     # Using pip
     pip install -r requirements.txt
+    ```
 
+    ```bash
     # Or using uv (faster)
     uv add -r requirements.txt
     ```
