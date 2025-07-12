@@ -192,7 +192,12 @@ class SportsAnalyticsDashboard {
 
 		const fieldContainer = document.getElementById('field-visualization')
 
-		// Clear existing markers
+		// Initialize pitch markings if not already done
+		if (!fieldContainer.querySelector('.pitch-initialized')) {
+			this.initializePitchMarkings(fieldContainer)
+		}
+
+		// Clear existing markers (but keep pitch markings)
 		fieldContainer
 			.querySelectorAll('.player-marker, .ball-marker')
 			.forEach((el) => el.remove())
@@ -209,9 +214,13 @@ class SportsAnalyticsDashboard {
 
 	addPlayerMarker(container, player) {
 		const marker = document.createElement('div')
-		marker.className = `player-marker ${this.getTeamClass(
-			player.team_name
-		)}`
+		const teamClass = this.getTeamClass(player.team_name)
+		marker.className = `player-marker ${teamClass}`
+
+		// Debug logging for team colors
+		console.log(
+			`Player ${player.id}: team_name=${player.team_name}, team_color=${player.team_color}, teamClass=${teamClass}`
+		)
 
 		// Position on field (FIFA standard dimensions: 105m x 68m)
 		const fieldWidth = container.offsetWidth
@@ -219,12 +228,66 @@ class SportsAnalyticsDashboard {
 		const x = (player.pos_pitch[0] / 105) * fieldWidth // FIFA standard 105m field width
 		const y = (player.pos_pitch[1] / 68) * fieldHeight // FIFA standard 68m field height
 
-		marker.style.left = `${Math.max(0, Math.min(x, fieldWidth - 12))}px`
-		marker.style.top = `${Math.max(0, Math.min(y, fieldHeight - 12))}px`
+		marker.style.left = `${Math.max(0, Math.min(x, fieldWidth - 20))}px`
+		marker.style.top = `${Math.max(0, Math.min(y, fieldHeight - 20))}px`
 
-		// Use team color if available
+		// Force team color application - more explicit logic
+		let appliedColor = null
+
+		// First try the team_color from backend
 		if (player.team_color) {
 			marker.style.backgroundColor = player.team_color
+			appliedColor = player.team_color
+			console.log(
+				`Applied backend color ${player.team_color} to player ${player.id}`
+			)
+		}
+		// Then try based on team_name
+		else if (player.team_name) {
+			if (
+				player.team_name === 'team_A' ||
+				player.team_name.toLowerCase().includes('team_a') ||
+				player.team_name.toLowerCase().includes('a')
+			) {
+				marker.style.backgroundColor = '#ff4444'
+				appliedColor = '#ff4444'
+				console.log(
+					`Applied red color based on team_name ${player.team_name} to player ${player.id}`
+				)
+			} else if (
+				player.team_name === 'team_B' ||
+				player.team_name.toLowerCase().includes('team_b') ||
+				player.team_name.toLowerCase().includes('b')
+			) {
+				marker.style.backgroundColor = '#4444ff'
+				appliedColor = '#4444ff'
+				console.log(
+					`Applied blue color based on team_name ${player.team_name} to player ${player.id}`
+				)
+			}
+		}
+		// Finally fallback to CSS classes
+		else {
+			if (teamClass === 'team-a') {
+				marker.style.backgroundColor = '#ff4444'
+				appliedColor = '#ff4444'
+				console.log(`Applied fallback red color to player ${player.id}`)
+			} else if (teamClass === 'team-b') {
+				marker.style.backgroundColor = '#4444ff'
+				appliedColor = '#4444ff'
+				console.log(
+					`Applied fallback blue color to player ${player.id}`
+				)
+			}
+		}
+
+		// Force the color with !important if needed
+		if (appliedColor) {
+			marker.style.setProperty(
+				'background-color',
+				appliedColor,
+				'important'
+			)
 		}
 
 		// Add tooltip with more information
@@ -246,8 +309,8 @@ class SportsAnalyticsDashboard {
 		const x = (ball.pos_pitch[0] / 105) * fieldWidth // FIFA standard 105m field width
 		const y = (ball.pos_pitch[1] / 68) * fieldHeight // FIFA standard 68m field height
 
-		marker.style.left = `${Math.max(0, Math.min(x, fieldWidth - 8))}px`
-		marker.style.top = `${Math.max(0, Math.min(y, fieldHeight - 8))}px`
+		marker.style.left = `${Math.max(0, Math.min(x, fieldWidth - 12))}px`
+		marker.style.top = `${Math.max(0, Math.min(y, fieldHeight - 12))}px`
 
 		marker.title = 'Ball'
 
@@ -259,6 +322,83 @@ class SportsAnalyticsDashboard {
 			return 'unknown'
 		}
 		return teamName.toLowerCase().includes('a') ? 'team-a' : 'team-b'
+	}
+
+	initializePitchMarkings(container) {
+		console.log('Initializing football pitch markings...')
+		// Add a marker to indicate pitch is initialized
+		const initMarker = document.createElement('div')
+		initMarker.className = 'pitch-initialized'
+		initMarker.style.display = 'none'
+		container.appendChild(initMarker)
+
+		// Center line
+		const centerLine = document.createElement('div')
+		centerLine.className = 'pitch-line center-line'
+		container.appendChild(centerLine)
+
+		// Center circle
+		const centerCircle = document.createElement('div')
+		centerCircle.className = 'center-circle'
+		container.appendChild(centerCircle)
+
+		// Center spot
+		const centerSpot = document.createElement('div')
+		centerSpot.className = 'center-spot'
+		container.appendChild(centerSpot)
+
+		// Left penalty area
+		const leftPenaltyArea = document.createElement('div')
+		leftPenaltyArea.className = 'penalty-area left'
+		container.appendChild(leftPenaltyArea)
+
+		// Right penalty area
+		const rightPenaltyArea = document.createElement('div')
+		rightPenaltyArea.className = 'penalty-area right'
+		container.appendChild(rightPenaltyArea)
+
+		// Left goal area
+		const leftGoalArea = document.createElement('div')
+		leftGoalArea.className = 'goal-area left'
+		container.appendChild(leftGoalArea)
+
+		// Right goal area
+		const rightGoalArea = document.createElement('div')
+		rightGoalArea.className = 'goal-area right'
+		container.appendChild(rightGoalArea)
+
+		// Left penalty spot
+		const leftPenaltySpot = document.createElement('div')
+		leftPenaltySpot.className = 'penalty-spot left'
+		container.appendChild(leftPenaltySpot)
+
+		// Right penalty spot
+		const rightPenaltySpot = document.createElement('div')
+		rightPenaltySpot.className = 'penalty-spot right'
+		container.appendChild(rightPenaltySpot)
+
+		// Left goal
+		const leftGoal = document.createElement('div')
+		leftGoal.className = 'goal left'
+		container.appendChild(leftGoal)
+
+		// Right goal
+		const rightGoal = document.createElement('div')
+		rightGoal.className = 'goal right'
+		container.appendChild(rightGoal)
+
+		// Corner arcs
+		const cornerArcs = [
+			'top-left',
+			'top-right',
+			'bottom-left',
+			'bottom-right',
+		]
+		cornerArcs.forEach((position) => {
+			const arc = document.createElement('div')
+			arc.className = `corner-arc ${position}`
+			container.appendChild(arc)
+		})
 	}
 
 	updateHeatmap(stats) {

@@ -19,7 +19,7 @@ from pathlib import Path
 
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, UploadFile, File, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -152,7 +152,19 @@ class DashboardServer:
         templates_dir = Path("templates")
         templates_dir.mkdir(exist_ok=True)
         
-        self.app.mount("/static", StaticFiles(directory="static"), name="static")
+        # Custom static file handler with no-cache headers
+        @self.app.get("/static/{file_path:path}")
+        async def serve_static_with_no_cache(file_path: str):
+            file_location = Path("static") / file_path
+            if file_location.exists() and file_location.is_file():
+                response = FileResponse(file_location)
+                # Add no-cache headers to force browser to reload
+                response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+                response.headers["Pragma"] = "no-cache"
+                response.headers["Expires"] = "0"
+                return response
+            raise HTTPException(status_code=404, detail="File not found")
+
         self.templates = Jinja2Templates(directory="templates")
     
     def _setup_routes(self):
@@ -1038,8 +1050,12 @@ class DashboardServer:
             team = "team_A" if i < 11 else "team_B"
             player_id = f"player_{i+1}"
 
+            # Debug logging
+            print(f"Creating player {player_id} for {team} (index {i})")
+
             # Get player role and base position
             if player_id not in state['player_roles']:
+                print(f"WARNING: Player {player_id} not found in roles, skipping")
                 continue  # Skip if role not initialized
 
             role_info = state['player_roles'][player_id]

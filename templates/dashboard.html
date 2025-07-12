@@ -13,7 +13,105 @@
 			rel="stylesheet"
 		/>
 		<script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
-		<link rel="stylesheet" href="/static/dashboard.css" />
+		<link rel="stylesheet" href="/static/dashboard.css?v=2024" />
+		<style>
+			/* Critical CSS for Football Pitch - Inline to ensure it loads */
+			#field-visualization {
+				background: linear-gradient(
+					90deg,
+					#2d5a27 0%,
+					#4a7c59 50%,
+					#2d5a27 100%
+				) !important;
+				position: relative !important;
+				border: 3px solid #ffffff !important;
+				border-radius: 8px !important;
+				overflow: hidden !important;
+			}
+
+			/* Player Markers - Force larger size */
+			.player-marker {
+				position: absolute !important;
+				width: 20px !important;
+				height: 20px !important;
+				border-radius: 50% !important;
+				border: 3px solid #fff !important;
+				box-shadow: 0 3px 6px rgba(0, 0, 0, 0.4) !important;
+				transition: all 0.3s ease !important;
+				z-index: 10 !important;
+			}
+
+			.player-marker.team-a {
+				background-color: #ff4444 !important;
+			}
+
+			.player-marker.team-b {
+				background-color: #4444ff !important;
+			}
+
+			/* Pitch Lines */
+			.pitch-line {
+				position: absolute !important;
+				background-color: #ffffff !important;
+				z-index: 5 !important;
+			}
+
+			.center-line {
+				width: 2px !important;
+				height: 100% !important;
+				left: 50% !important;
+				top: 0 !important;
+				transform: translateX(-50%) !important;
+			}
+
+			.center-circle {
+				width: 120px !important;
+				height: 120px !important;
+				border: 2px solid #ffffff !important;
+				border-radius: 50% !important;
+				background: transparent !important;
+				position: absolute !important;
+				left: 50% !important;
+				top: 50% !important;
+				transform: translate(-50%, -50%) !important;
+				z-index: 5 !important;
+			}
+
+			.center-spot {
+				width: 6px !important;
+				height: 6px !important;
+				background-color: #ffffff !important;
+				border-radius: 50% !important;
+				position: absolute !important;
+				left: 50% !important;
+				top: 50% !important;
+				transform: translate(-50%, -50%) !important;
+				z-index: 6 !important;
+			}
+
+			.penalty-area {
+				position: absolute !important;
+				border: 2px solid #ffffff !important;
+				background: transparent !important;
+				z-index: 5 !important;
+			}
+
+			.penalty-area.left {
+				width: 80px !important;
+				height: 200px !important;
+				left: 0 !important;
+				top: 50% !important;
+				transform: translateY(-50%) !important;
+			}
+
+			.penalty-area.right {
+				width: 80px !important;
+				height: 200px !important;
+				right: 0 !important;
+				top: 50% !important;
+				transform: translateY(-50%) !important;
+			}
+		</style>
 	</head>
 	<body>
 		<div class="container-fluid">
@@ -963,6 +1061,63 @@
 		<!-- Bootstrap JS -->
 		<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
 		<!-- Dashboard JS -->
-		<script src="/static/dashboard.js"></script>
+		<script src="/static/dashboard.js?v=2024"></script>
+		<script>
+			// Force pitch initialization when page loads
+			document.addEventListener('DOMContentLoaded', function () {
+				console.log('DOM loaded, forcing pitch initialization...')
+
+				// Wait a bit for the field container to be ready
+				setTimeout(function () {
+					const fieldContainer = document.getElementById(
+						'field-visualization'
+					)
+					if (fieldContainer) {
+						console.log(
+							'Field container found, initializing pitch...'
+						)
+
+						// Clear any existing content
+						fieldContainer.innerHTML = ''
+
+						// Force create pitch markings
+						createPitchMarkings(fieldContainer)
+					} else {
+						console.log('Field container not found')
+					}
+				}, 1000)
+			})
+
+			function createPitchMarkings(container) {
+				console.log('Creating pitch markings...')
+
+				// Center line
+				const centerLine = document.createElement('div')
+				centerLine.className = 'pitch-line center-line'
+				container.appendChild(centerLine)
+
+				// Center circle
+				const centerCircle = document.createElement('div')
+				centerCircle.className = 'center-circle'
+				container.appendChild(centerCircle)
+
+				// Center spot
+				const centerSpot = document.createElement('div')
+				centerSpot.className = 'center-spot'
+				container.appendChild(centerSpot)
+
+				// Left penalty area
+				const leftPenaltyArea = document.createElement('div')
+				leftPenaltyArea.className = 'penalty-area left'
+				container.appendChild(leftPenaltyArea)
+
+				// Right penalty area
+				const rightPenaltyArea = document.createElement('div')
+				rightPenaltyArea.className = 'penalty-area right'
+				container.appendChild(rightPenaltyArea)
+
+				console.log('Pitch markings created successfully!')
+			}
+		</script>
 	</body>
 </html>

@@ -1,4 +1,4 @@
-/* Sports Analytics Dashboard Styles */
+/* Sports Analytics Dashboard Styles - Updated with Football Pitch */
 
 body {
 	background-color: #f8f9fa;
@@ -147,11 +147,11 @@ body {
 /* Player Markers */
 .player-marker {
 	position: absolute;
-	width: 12px;
-	height: 12px;
+	width: 20px;
+	height: 20px;
 	border-radius: 50%;
-	border: 2px solid #fff;
-	box-shadow: 0 2px 4px rgba(0, 0, 0, 0.3);
+	border: 3px solid #fff;
+	box-shadow: 0 3px 6px rgba(0, 0, 0, 0.4);
 	transition: all 0.3s ease;
 	z-index: 10;
 }
@@ -176,13 +176,226 @@ body {
 /* Ball Marker */
 .ball-marker {
 	position: absolute;
-	width: 8px;
-	height: 8px;
+	width: 12px;
+	height: 12px;
 	border-radius: 50%;
 	background-color: #ffffff;
 	border: 2px solid #333;
-	box-shadow: 0 2px 4px rgba(0, 0, 0, 0.5);
+	box-shadow: 0 3px 6px rgba(0, 0, 0, 0.6);
 	z-index: 15;
+}
+
+/* Football Pitch Styling */
+#field-visualization {
+	background: linear-gradient(90deg, #2d5a27 0%, #4a7c59 50%, #2d5a27 100%);
+	position: relative;
+	border: 3px solid #ffffff;
+	border-radius: 8px;
+	overflow: hidden;
+}
+
+/* Pitch Lines */
+.pitch-line {
+	position: absolute;
+	background-color: #ffffff;
+	z-index: 5;
+}
+
+/* Center Line */
+.center-line {
+	width: 2px;
+	height: 100%;
+	left: 50%;
+	top: 0;
+	transform: translateX(-50%);
+}
+
+/* Center Circle */
+.center-circle {
+	width: 120px;
+	height: 120px;
+	border: 2px solid #ffffff;
+	border-radius: 50%;
+	background: transparent;
+	position: absolute;
+	left: 50%;
+	top: 50%;
+	transform: translate(-50%, -50%);
+	z-index: 5;
+}
+
+/* Center Spot */
+.center-spot {
+	width: 6px;
+	height: 6px;
+	background-color: #ffffff;
+	border-radius: 50%;
+	position: absolute;
+	left: 50%;
+	top: 50%;
+	transform: translate(-50%, -50%);
+	z-index: 6;
+}
+
+/* Penalty Areas */
+.penalty-area {
+	position: absolute;
+	border: 2px solid #ffffff;
+	background: transparent;
+	z-index: 5;
+}
+
+.penalty-area.left {
+	width: 80px;
+	height: 200px;
+	left: 0;
+	top: 50%;
+	transform: translateY(-50%);
+}
+
+.penalty-area.right {
+	width: 80px;
+	height: 200px;
+	right: 0;
+	top: 50%;
+	transform: translateY(-50%);
+}
+
+/* Goal Areas */
+.goal-area {
+	position: absolute;
+	border: 2px solid #ffffff;
+	background: transparent;
+	z-index: 5;
+}
+
+.goal-area.left {
+	width: 30px;
+	height: 100px;
+	left: 0;
+	top: 50%;
+	transform: translateY(-50%);
+}
+
+.goal-area.right {
+	width: 30px;
+	height: 100px;
+	right: 0;
+	top: 50%;
+	transform: translateY(-50%);
+}
+
+/* Penalty Spots */
+.penalty-spot {
+	width: 4px;
+	height: 4px;
+	background-color: #ffffff;
+	border-radius: 50%;
+	position: absolute;
+	top: 50%;
+	transform: translateY(-50%);
+	z-index: 6;
+}
+
+.penalty-spot.left {
+	left: 55px;
+}
+
+.penalty-spot.right {
+	right: 55px;
+}
+
+/* Goals */
+.goal {
+	position: absolute;
+	background-color: #ffffff;
+	z-index: 4;
+}
+
+.goal.left {
+	width: 4px;
+	height: 40px;
+	left: -2px;
+	top: 50%;
+	transform: translateY(-50%);
+}
+
+.goal.right {
+	width: 4px;
+	height: 40px;
+	right: -2px;
+	top: 50%;
+	transform: translateY(-50%);
+}
+
+/* Corner Arcs */
+.corner-arc {
+	position: absolute;
+	width: 20px;
+	height: 20px;
+	border: 2px solid #ffffff;
+	background: transparent;
+	z-index: 5;
+}
+
+.corner-arc.top-left {
+	top: -1px;
+	left: -1px;
+	border-radius: 0 0 20px 0;
+	border-top: none;
+	border-left: none;
+}
+
+.corner-arc.top-right {
+	top: -1px;
+	right: -1px;
+	border-radius: 0 0 0 20px;
+	border-top: none;
+	border-right: none;
+}
+
+.corner-arc.bottom-left {
+	bottom: -1px;
+	left: -1px;
+	border-radius: 0 20px 0 0;
+	border-bottom: none;
+	border-left: none;
+}
+
+.corner-arc.bottom-right {
+	bottom: -1px;
+	right: -1px;
+	border-radius: 20px 0 0 0;
+	border-bottom: none;
+	border-right: none;
+}
+
+/* Responsive Pitch Markings */
+@media (max-width: 768px) {
+	.center-circle {
+		width: 80px;
+		height: 80px;
+	}
+
+	.penalty-area.left,
+	.penalty-area.right {
+		width: 50px;
+		height: 120px;
+	}
+
+	.goal-area.left,
+	.goal-area.right {
+		width: 20px;
+		height: 60px;
+	}
+
+	.penalty-spot.left {
+		left: 35px;
+	}
+
+	.penalty-spot.right {
+		right: 35px;
+	}
 }
 
 /* Responsive Design */
