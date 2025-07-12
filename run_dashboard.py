@@ -16,8 +16,9 @@ import signal
 import sys
 
 # Import our modules
-from ai import Config, VideoProcessor
-from dashboard_server import DashboardServer
+from src.core.config import Config
+from src.analytics.sports_analyzer import VideoProcessor
+from src.api.dashboard_server import DashboardServer
 
 # Set environment variables and suppress warnings before importing any ML libraries
 os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
@@ -39,7 +40,7 @@ logger = logging.getLogger(__name__)
 class DashboardRunner:
     """Manages both the video processor and dashboard server"""
     
-    def __init__(self, config_path: str = 'config.yaml', host: str = "localhost", port: int = 8000):
+    def __init__(self, config_path: str = 'config/config.yaml', host: str = "localhost", port: int = 8000):
         self.config_path = config_path
         self.host = host
         self.port = port
@@ -64,6 +65,8 @@ class DashboardRunner:
     
     def _signal_handler(self, signum, frame):
         """Handle shutdown signals"""
+        logging.info(f"Received signal {signum}, shutting down...")
+        self.shutdown()
     def initialize(self):
         """Initialize all components"""
         try:

@@ -4,7 +4,7 @@ numpy>=1.21.0
 pandas>=1.3.0
 torch>=1.12.0
 torchvision>=0.13.0
-git+https://github.com/iMoonLab/yolov13.git
+ultralytics
 scikit-learn>=1.0.0
 psutil>=5.8.0
 joblib>=1.1.0
@@ -16,7 +16,6 @@ supervision>=0.22.0
 lap>=0.5.12
 
 easyocr>=1.7.2
-pillow>=11.3.0
 certifi>=2025.7.9
 
 # Visualization dependencies

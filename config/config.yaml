@@ -1,0 +1,49 @@
+# Sports Analytics Configuration File
+video:
+    path: null # Video path will be set at runtime via upload
+    supported_formats: ['.mp4', '.avi', '.mov', '.mkv']
+    min_resolution: [320, 240]
+    max_resolution: [4096, 2160]
+
+output:
+    csv_path: 'enterprise_analytics_output.csv'
+    checkpoint_dir: './analyzer_checkpoints'
+    log_file: 'sports_analytics.log'
+
+models:
+    yolo_path: 'yolov8n.pt'
+    segmentation_path: 'path/to/your/segmentation_model.pth'
+    jersey_yolo_path: null
+    team_roster_path: null
+
+processing:
+    team_n_clusters: 3
+    team_feature_bins: 16
+    min_crop_size: 100
+    max_crops_per_cluster: 15
+    frame_skip_interval: 4 # Increased from 2 to 4 for better performance
+    max_processing_queue_size: 16 # Reduced from 32 to 16 to save memory
+    team_samples_to_collect: 200 # Reduced from 300 to 200 for faster processing
+    homography_recal_threshold: 3.0
+    homography_check_interval: 300 # Increased from 150 to 300 to reduce overhead
+    action_sequence_length: 20 # Reduced from 30 to 20 for faster processing
+    processing_timeout: 2.0 # Increased from 1.0 to 2.0 to avoid timeouts
+    max_retries: 3
+    # Feature flags to prevent common errors
+    enable_homography: true # Disabled homography calibration to prevent calibration spam and improve performance
+
+    # Performance optimizations
+    enable_jersey_detection: true # Disable jersey number detection for better performance
+    enable_ocr: true # Disable OCR processing for better performance
+
+logging:
+    level: 'INFO'
+    format: '%(asctime)s - %(levelname)s - [%(threadName)s] - %(message)s'
+    max_file_size_mb: 10
+    backup_count: 5
+
+performance:
+    memory_warning_threshold: 85
+    slow_frame_threshold: 1.0
+    metrics_log_interval: 30
+    enable_profiling: false
