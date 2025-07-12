@@ -213,19 +213,26 @@ class SportsAnalyticsDashboard {
 			player.team_name
 		)}`
 
-		// Position on field (assuming field dimensions)
+		// Position on field (FIFA standard dimensions: 105m x 68m)
 		const fieldWidth = container.offsetWidth
 		const fieldHeight = container.offsetHeight
-		const x = (player.pos_pitch[0] / 100) * fieldWidth // Assuming 100m field width
-		const y = (player.pos_pitch[1] / 60) * fieldHeight // Assuming 60m field height
+		const x = (player.pos_pitch[0] / 105) * fieldWidth // FIFA standard 105m field width
+		const y = (player.pos_pitch[1] / 68) * fieldHeight // FIFA standard 68m field height
 
 		marker.style.left = `${Math.max(0, Math.min(x, fieldWidth - 12))}px`
 		marker.style.top = `${Math.max(0, Math.min(y, fieldHeight - 12))}px`
 
-		// Add tooltip
-		marker.title = `Player ${player.id} - ${
+		// Use team color if available
+		if (player.team_color) {
+			marker.style.backgroundColor = player.team_color
+		}
+
+		// Add tooltip with more information
+		marker.title = `${player.player_name || player.id} - ${
 			player.team_name || 'Unknown'
-		} - Jersey: ${player.jersey_number || 'N/A'}`
+		} - Jersey: ${player.jersey_number || 'N/A'} - Speed: ${(
+			player.player_speed_kmh || 0
+		).toFixed(1)} km/h`
 
 		container.appendChild(marker)
 	}
@@ -236,8 +243,8 @@ class SportsAnalyticsDashboard {
 
 		const fieldWidth = container.offsetWidth
 		const fieldHeight = container.offsetHeight
-		const x = (ball.pos_pitch[0] / 100) * fieldWidth
-		const y = (ball.pos_pitch[1] / 60) * fieldHeight
+		const x = (ball.pos_pitch[0] / 105) * fieldWidth // FIFA standard 105m field width
+		const y = (ball.pos_pitch[1] / 68) * fieldHeight // FIFA standard 68m field height
 
 		marker.style.left = `${Math.max(0, Math.min(x, fieldWidth - 8))}px`
 		marker.style.top = `${Math.max(0, Math.min(y, fieldHeight - 8))}px`

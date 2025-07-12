@@ -997,7 +997,7 @@ class DashboardServer:
         import random
         import math
 
-        # Field dimensions (in meters)
+        # Field dimensions (in meters) - Standard FIFA dimensions
         field_width = 105
         field_height = 68
 
@@ -1009,64 +1009,87 @@ class DashboardServer:
                 'last_event_time': 0,
                 'ball_position': [field_width/2, field_height/2],
                 'player_positions': {},
+                'player_roles': {},
                 'team_A_score': 0,
                 'team_B_score': 0,
-                'last_possession_change': 0
+                'last_possession_change': 0,
+                'formation_initialized': False
+            }
+
+            # Initialize team colors in game stats
+            self.game_stats['team_colors'] = {
+                'team_A': '#ff4444',  # Red
+                'team_B': '#4444ff'   # Blue
             }
 
         state = self.simulation_state
 
+        # Initialize formations if not done
+        if not state['formation_initialized']:
+            self._initialize_team_formations(state, field_width, field_height)
+            state['formation_initialized'] = True
+
         # Generate realistic player positions
         players = []
-        num_players = 20  # Fixed number for consistency
+        num_players = 22  # 11 players per team (including goalkeepers)
 
         for i in range(num_players):
             # Assign team (balanced)
-            team = "team_A" if i < 10 else "team_B"
+            team = "team_A" if i < 11 else "team_B"
             player_id = f"player_{i+1}"
 
-            # Initialize player position if not exists
+            # Get player role and base position
+            if player_id not in state['player_roles']:
+                continue  # Skip if role not initialized
+
+            role_info = state['player_roles'][player_id]
+            base_x, base_y = role_info['base_position']
+            role = role_info['role']
+
+            # Get current position or initialize near base position
             if player_id not in state['player_positions']:
-                if team == "team_A":
-                    x = random.uniform(5, field_width * 0.6)
-                else:
-                    x = random.uniform(field_width * 0.4, field_width - 5)
-                y = random.uniform(5, field_height - 5)
+                # Start near base position with some variation
+                x = base_x + random.uniform(-3, 3)
+                y = base_y + random.uniform(-3, 3)
                 state['player_positions'][player_id] = [x, y]
 
-            # Get current position and add realistic movement
+            # Get current position and calculate realistic movement
             x, y = state['player_positions'][player_id]
 
-            # Add realistic movement based on game flow
-            movement_speed = 0.3  # meters per frame at 30fps
-
-            # Players move towards ball when their team has possession
+            # Calculate movement based on role, game situation, and ball position
             ball_x, ball_y = state['ball_position']
-            if team == state['current_possession_team']:
-                # Move towards ball (attacking)
-                dx = (ball_x - x) * 0.02
-                dy = (ball_y - y) * 0.02
-            else:
-                # Defensive positioning
-                dx = (field_width/2 - x) * 0.01
-                dy = (field_height/2 - y) * 0.01
+            dx, dy = self._calculate_player_movement(
+                x, y, base_x, base_y, ball_x, ball_y,
+                team, role, state['current_possession_team'],
+                field_width, field_height
+            )
 
-            # Add some randomness
-            dx += random.uniform(-movement_speed, movement_speed)
-            dy += random.uniform(-movement_speed, movement_speed)
-
+            # Apply movement
             x += dx
             y += dy
 
-            # Keep within bounds
-            x = max(2, min(field_width - 2, x))
-            y = max(2, min(field_height - 2, y))
+            # Keep within realistic bounds for the role
+            x, y = self._constrain_player_position(x, y, role, team, field_width, field_height)
 
             state['player_positions'][player_id] = [x, y]
 
             # Calculate realistic speed
             speed_kmh = math.sqrt(dx*dx + dy*dy) * 30 * 3.6  # Convert to km/h
             speed_kmh = max(0, min(35, speed_kmh))  # Cap at realistic max speed
+
+            # Get jersey number and player name based on position in team
+            team_index = i if team == "team_A" else i - 11
+            jersey_number = str(team_index + 1)
+
+            # Generate realistic player names based on role
+            role_names = {
+                'goalkeeper': ['Keeper', 'Guardian', 'Goalie'],
+                'defender': ['Defender', 'Back', 'Shield'],
+                'midfielder': ['Mid', 'Center', 'Engine'],
+                'forward': ['Striker', 'Forward', 'Scorer']
+            }
+            role_name = random.choice(role_names.get(role, ['Player']))
+            player_name = f"{role_name} {jersey_number}"
 
             # Generate realistic player data matching real video processing output
             player = {
@@ -1084,8 +1107,9 @@ class DashboardServer:
                 "pos_pitch": [x, y],
                 "team_name": team,
                 "team": team,  # Add 'team' field (both team_name and team are used)
-                "jersey_number": str((i % 11) + 1),
-                "player_name": f"Player {(i % 11) + 1}",
+                "team_color": self.game_stats['team_colors'][team],  # Add team color
+                "jersey_number": jersey_number,
+                "player_name": player_name,
                 "player_speed_kmh": speed_kmh,
                 "distance_covered_m": math.sqrt(dx*dx + dy*dy),
                 "ball_possession": False,
@@ -1098,15 +1122,33 @@ class DashboardServer:
         # Update ball position with realistic movement
         ball_x, ball_y = state['ball_position']
 
-        # Ball follows possession team's movement
+        # More realistic ball movement
         possessing_team_players = [p for p in players if p["team_name"] == state['current_possession_team']]
-        if possessing_team_players:
-            # Ball moves towards average position of possessing team
-            avg_x = sum(p["pos_pitch"][0] for p in possessing_team_players) / len(possessing_team_players)
-            avg_y = sum(p["pos_pitch"][1] for p in possessing_team_players) / len(possessing_team_players)
 
-            ball_x += (avg_x - ball_x) * 0.05 + random.uniform(-1, 1)
-            ball_y += (avg_y - ball_y) * 0.05 + random.uniform(-1, 1)
+        # Check for possession changes (every 8-25 seconds)
+        if game_time - state['last_possession_change'] > random.uniform(8, 25):
+            state['current_possession_team'] = 'team_B' if state['current_possession_team'] == 'team_A' else 'team_A'
+            state['last_possession_change'] = game_time
+            possessing_team_players = [p for p in players if p["team_name"] == state['current_possession_team']]
+
+        if possessing_team_players:
+            # Find the most advanced player of the possessing team
+            if state['current_possession_team'] == 'team_A':
+                # Team A attacks right, so find player with highest x
+                target_player = max(possessing_team_players, key=lambda p: p["pos_pitch"][0])
+            else:
+                # Team B attacks left, so find player with lowest x
+                target_player = min(possessing_team_players, key=lambda p: p["pos_pitch"][0])
+
+            target_x, target_y = target_player["pos_pitch"]
+
+            # Ball moves toward the target player with some randomness
+            ball_speed = 0.8  # Ball moves faster than players
+            dx = (target_x - ball_x) * 0.08 + random.uniform(-ball_speed, ball_speed)
+            dy = (target_y - ball_y) * 0.08 + random.uniform(-ball_speed, ball_speed)
+
+            ball_x += dx
+            ball_y += dy
 
         # Keep ball within bounds
         ball_x = max(1, min(field_width - 1, ball_x))
@@ -1123,7 +1165,7 @@ class DashboardServer:
             "tracking_quality": random.uniform(0.85, 1.0)  # Add tracking_quality field
         }
 
-        # Assign ball possession to nearest player
+        # Assign ball possession to nearest player (more realistic distance)
         min_distance = float('inf')
         possessing_player = None
         for player in players:
@@ -1133,7 +1175,8 @@ class DashboardServer:
                 min_distance = distance
                 possessing_player = player
 
-        if possessing_player and min_distance < 2:  # Within 2 meters
+        # Only assign possession if player is very close to ball
+        if possessing_player and min_distance < 1.5:  # Within 1.5 meters
             possessing_player["ball_possession"] = True
 
         # Generate realistic events with proper timing
@@ -1206,8 +1249,156 @@ class DashboardServer:
             "events": events,
             "field_dimensions": [field_width, field_height],
             "possession_team": state['current_possession_team'],
-            "processing_time": processing_time
+            "processing_time": processing_time,
+            "team_colors": self.game_stats['team_colors']  # Add team colors to frame data
         }
+
+    def _initialize_team_formations(self, state: Dict, field_width: float, field_height: float):
+        """Initialize realistic team formations (4-4-2 formation)"""
+
+        # Team A formation (left side of field) - 4-4-2
+        team_a_positions = {
+            'player_1': {'role': 'goalkeeper', 'base_position': [8, field_height/2]},
+            'player_2': {'role': 'defender', 'base_position': [20, field_height * 0.2]},
+            'player_3': {'role': 'defender', 'base_position': [20, field_height * 0.4]},
+            'player_4': {'role': 'defender', 'base_position': [20, field_height * 0.6]},
+            'player_5': {'role': 'defender', 'base_position': [20, field_height * 0.8]},
+            'player_6': {'role': 'midfielder', 'base_position': [35, field_height * 0.25]},
+            'player_7': {'role': 'midfielder', 'base_position': [35, field_height * 0.45]},
+            'player_8': {'role': 'midfielder', 'base_position': [35, field_height * 0.55]},
+            'player_9': {'role': 'midfielder', 'base_position': [35, field_height * 0.75]},
+            'player_10': {'role': 'forward', 'base_position': [50, field_height * 0.35]},
+            'player_11': {'role': 'forward', 'base_position': [50, field_height * 0.65]}
+        }
+
+        # Team B formation (right side of field) - 4-4-2
+        team_b_positions = {
+            'player_12': {'role': 'goalkeeper', 'base_position': [field_width - 8, field_height/2]},
+            'player_13': {'role': 'defender', 'base_position': [field_width - 20, field_height * 0.2]},
+            'player_14': {'role': 'defender', 'base_position': [field_width - 20, field_height * 0.4]},
+            'player_15': {'role': 'defender', 'base_position': [field_width - 20, field_height * 0.6]},
+            'player_16': {'role': 'defender', 'base_position': [field_width - 20, field_height * 0.8]},
+            'player_17': {'role': 'midfielder', 'base_position': [field_width - 35, field_height * 0.25]},
+            'player_18': {'role': 'midfielder', 'base_position': [field_width - 35, field_height * 0.45]},
+            'player_19': {'role': 'midfielder', 'base_position': [field_width - 35, field_height * 0.55]},
+            'player_20': {'role': 'midfielder', 'base_position': [field_width - 35, field_height * 0.75]},
+            'player_21': {'role': 'forward', 'base_position': [field_width - 50, field_height * 0.35]},
+            'player_22': {'role': 'forward', 'base_position': [field_width - 50, field_height * 0.65]}
+        }
+
+        # Combine formations
+        state['player_roles'] = {**team_a_positions, **team_b_positions}
+
+    def _calculate_player_movement(self, x: float, y: float, base_x: float, base_y: float,
+                                 ball_x: float, ball_y: float, team: str, role: str,
+                                 possession_team: str, field_width: float, field_height: float) -> tuple:
+        """Calculate realistic player movement based on role and game situation"""
+        import random
+        import math
+
+        dx, dy = 0, 0
+
+        # Base movement speed varies by role
+        base_speed = {
+            'goalkeeper': 0.1,
+            'defender': 0.2,
+            'midfielder': 0.3,
+            'forward': 0.25
+        }.get(role, 0.2)
+
+        # Distance to ball
+        ball_distance = math.sqrt((ball_x - x)**2 + (ball_y - y)**2)
+
+        if role == 'goalkeeper':
+            # Goalkeepers stay near goal but move slightly toward ball
+            if ball_distance > 15:  # Only move if ball is not too close
+                dx = (base_x - x) * 0.05  # Return to base position
+                dy = (ball_y - y) * 0.02  # Move slightly toward ball's y position
+            else:
+                # Move more actively when ball is close
+                dx = (ball_x - x) * 0.03
+                dy = (ball_y - y) * 0.03
+
+        elif team == possession_team:
+            # Attacking team movement
+            if role == 'forward':
+                # Forwards move toward goal and support ball
+                goal_x = field_width if team == 'team_A' else 0
+                dx = (goal_x - x) * 0.01 + (ball_x - x) * 0.02
+                dy = (ball_y - y) * 0.015
+            elif role == 'midfielder':
+                # Midfielders support the ball and maintain spacing
+                dx = (ball_x - x) * 0.015
+                dy = (ball_y - y) * 0.01
+            else:  # defender
+                # Defenders move up but maintain defensive shape
+                dx = (base_x + 10 - x) * 0.01 if team == 'team_A' else (base_x - 10 - x) * 0.01
+                dy = (base_y - y) * 0.01
+        else:
+            # Defending team movement
+            if role == 'defender':
+                # Defenders mark space and move toward ball
+                dx = (ball_x - x) * 0.01
+                dy = (ball_y - y) * 0.015
+            elif role == 'midfielder':
+                # Midfielders drop back and mark space
+                defensive_x = base_x - 5 if team == 'team_A' else base_x + 5
+                dx = (defensive_x - x) * 0.01 + (ball_x - x) * 0.005
+                dy = (ball_y - y) * 0.01
+            else:  # forward
+                # Forwards track back but stay ready for counter
+                dx = (base_x - x) * 0.005
+                dy = (base_y - y) * 0.005
+
+        # Add some randomness for natural movement
+        dx += random.uniform(-base_speed * 0.3, base_speed * 0.3)
+        dy += random.uniform(-base_speed * 0.3, base_speed * 0.3)
+
+        # Limit movement speed
+        max_movement = base_speed
+        movement_magnitude = math.sqrt(dx**2 + dy**2)
+        if movement_magnitude > max_movement:
+            dx = (dx / movement_magnitude) * max_movement
+            dy = (dy / movement_magnitude) * max_movement
+
+        return dx, dy
+
+    def _constrain_player_position(self, x: float, y: float, role: str, team: str,
+                                 field_width: float, field_height: float) -> tuple:
+        """Constrain player position based on role and realistic boundaries"""
+
+        # General field boundaries
+        x = max(2, min(field_width - 2, x))
+        y = max(2, min(field_height - 2, y))
+
+        # Role-specific constraints
+        if role == 'goalkeeper':
+            # Goalkeepers stay in penalty area
+            if team == 'team_A':
+                x = max(2, min(18, x))  # Left penalty area
+            else:
+                x = max(field_width - 18, min(field_width - 2, x))  # Right penalty area
+            # Stay within reasonable y range of goal
+            y = max(field_height * 0.25, min(field_height * 0.75, y))
+
+        elif role == 'defender':
+            # Defenders generally stay in their half but can advance
+            if team == 'team_A':
+                x = max(2, min(field_width * 0.7, x))
+            else:
+                x = max(field_width * 0.3, min(field_width - 2, x))
+
+        elif role == 'midfielder':
+            # Midfielders have more freedom but generally stay in middle areas
+            if team == 'team_A':
+                x = max(15, min(field_width * 0.85, x))
+            else:
+                x = max(field_width * 0.15, min(field_width - 15, x))
+
+        # Forwards can go anywhere but tend to stay in attacking areas
+        # No additional constraints for forwards
+
+        return x, y
 
     def run(self):
         """Run the server (blocking)"""
