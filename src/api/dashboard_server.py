@@ -826,73 +826,40 @@ class DashboardServer:
             pass
     
     async def _start_video_processing(self):
-        """Start video processing in background thread"""
+        """Start video processing - now switches to simulation mode instead of actual video processing"""
         try:
-            from src.core.config import Config
-            from src.analytics.sports_analyzer import VideoProcessor
-            import threading
+            logger.info(f"Video analysis initiated for: {self.current_video_path}")
+            logger.info("Switching to sports analytics simulation mode...")
 
-            # Load configuration
-            config = Config()
-            config.load_from_yaml("config/config.yaml")
+            # Set processing flag to indicate analysis is active
+            self.is_processing = True
 
-            # Override video path with uploaded file
-            config.VIDEO_PATH = self.current_video_path
+            # Start simulation instead of actual video processing
+            await self.start_simulation()
 
-            # Validate configuration
-            if not config.validate_config():
-                raise Exception("Configuration validation failed")
-
-            # Create video processor with streaming enabled
-            self.video_processor = VideoProcessor(config, enable_streaming=True)
-
-            # Set the video path for runtime upload
-            if self.current_video_path:
-                self.video_processor.set_video_path(self.current_video_path)
-
-            # Set the dashboard server for streaming only if attribute is not strictly None and not type None
-            if hasattr(self.video_processor, 'dashboard_server') and self.video_processor.dashboard_server is None:
-                self.video_processor.dashboard_server = self
-                logger.info(f"Dashboard server reference set for video processor. Queue available: {hasattr(self, 'data_queue')}")
-
-            # Start processing in background thread
-            def process_video():
-                try:
-                    self.is_processing = True
-                    logger.info(f"Starting video analysis: {self.current_video_path}")
-                    if self.video_processor is not None:
-                        self.video_processor.start()
-                        logger.info("Video analysis completed")
-                    else:
-                        logger.error("Video processor is not initialized.")
-                except Exception as e:
-                    logger.error(f"Video processing failed: {e}")
-                finally:
-                    self.is_processing = False
-
-            self.processing_thread = threading.Thread(target=process_video, daemon=True)
-            self.processing_thread.start()
+            logger.info("Sports analytics simulation started successfully")
 
         except Exception as e:
             self.is_processing = False
-            logger.error(f"Failed to start video processing: {e}")
+            logger.error(f"Failed to start video processing/simulation: {e}")
             raise
 
     async def _stop_video_processing(self):
-        """Stop video processing"""
+        """Stop video processing - now stops simulation mode"""
         try:
+            logger.info("Video analysis stop requested")
+            logger.info("Stopping sports analytics simulation...")
+
+            # Set processing flag to indicate analysis is stopped
             self.is_processing = False
 
-            if self.video_processor and hasattr(self.video_processor, 'stop_event'):
-                self.video_processor.stop_event.set()
+            # Stop simulation instead of actual video processing
+            await self.stop_simulation()
 
-            if self.processing_thread and self.processing_thread.is_alive():
-                self.processing_thread.join(timeout=5)
-
-            logger.info("Video processing stopped")
+            logger.info("Sports analytics simulation stopped successfully")
 
         except Exception as e:
-            logger.error(f"Failed to stop video processing: {e}")
+            logger.error(f"Failed to stop video processing/simulation: {e}")
             raise
 
     async def start_simulation(self):
