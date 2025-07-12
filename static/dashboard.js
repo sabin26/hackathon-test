@@ -26,6 +26,10 @@ class SportsAnalyticsDashboard {
 		this.isSimulating = false
 		this.simulationInterval = null
 
+		// Button loading states
+		this.isStartButtonLoading = false
+		this.isStopButtonLoading = false
+
 		this.init()
 	}
 
@@ -980,6 +984,13 @@ class SportsAnalyticsDashboard {
 		const startBtn = document.getElementById('start-analysis-btn')
 		const stopBtn = document.getElementById('stop-analysis-btn')
 
+		console.log('Setting up video upload controls:', {
+			fileInput: !!fileInput,
+			selectUploadBtn: !!selectUploadBtn,
+			startBtn: !!startBtn,
+			stopBtn: !!stopBtn,
+		})
+
 		// Handle single button click - opens file dialog
 		selectUploadBtn.addEventListener('click', () => {
 			fileInput.click()
@@ -993,9 +1004,64 @@ class SportsAnalyticsDashboard {
 			}
 		})
 
-		// Handle analysis start/stop
-		startBtn.addEventListener('click', () => this.startAnalysis())
-		stopBtn.addEventListener('click', () => this.stopAnalysis())
+		// Handle analysis start/stop with immediate feedback
+		if (startBtn) {
+			startBtn.addEventListener('click', (e) => {
+				e.preventDefault()
+				console.log(
+					'Start button clicked - applying immediate feedback'
+				)
+
+				// Set loading flag
+				this.isStartButtonLoading = true
+
+				// Immediately disable and update button - force the change
+				startBtn.disabled = true
+				startBtn.innerHTML =
+					'<i class="fas fa-spinner fa-spin me-2"></i>Starting...'
+				startBtn.style.pointerEvents = 'none' // Extra protection
+
+				// Force a DOM update
+				startBtn.offsetHeight
+
+				console.log('Start button UI updated, calling startAnalysis()')
+
+				// Use setTimeout to ensure UI update happens first
+				setTimeout(() => {
+					this.startAnalysis()
+				}, 0)
+			})
+		} else {
+			console.error('Start analysis button not found!')
+		}
+
+		if (stopBtn) {
+			stopBtn.addEventListener('click', (e) => {
+				e.preventDefault()
+				console.log('Stop button clicked - applying immediate feedback')
+
+				// Set loading flag
+				this.isStopButtonLoading = true
+
+				// Immediately disable and update button - force the change
+				stopBtn.disabled = true
+				stopBtn.innerHTML =
+					'<i class="fas fa-spinner fa-spin me-2"></i>Stopping...'
+				stopBtn.style.pointerEvents = 'none' // Extra protection
+
+				// Force a DOM update
+				stopBtn.offsetHeight
+
+				console.log('Stop button UI updated, calling stopAnalysis()')
+
+				// Use setTimeout to ensure UI update happens first
+				setTimeout(() => {
+					this.stopAnalysis()
+				}, 0)
+			})
+		} else {
+			console.error('Stop analysis button not found!')
+		}
 	}
 
 	showSelectedFileInfo(file) {
@@ -1067,6 +1133,8 @@ class SportsAnalyticsDashboard {
 	}
 
 	async startAnalysis() {
+		const startBtn = document.getElementById('start-analysis-btn')
+
 		try {
 			const response = await fetch('/api/start-analysis', {
 				method: 'POST',
@@ -1079,6 +1147,7 @@ class SportsAnalyticsDashboard {
 					'Analysis started successfully',
 					'success'
 				)
+				this.isStartButtonLoading = false
 				this.updateProcessingStatus(true)
 			} else {
 				throw new Error(result.detail || 'Failed to start analysis')
@@ -1088,10 +1157,18 @@ class SportsAnalyticsDashboard {
 				`Failed to start analysis: ${error.message}`,
 				'danger'
 			)
+			// Clear loading flag and re-enable start button on error
+			this.isStartButtonLoading = false
+			startBtn.disabled = false
+			startBtn.innerHTML =
+				'<i class="fas fa-play me-2"></i>Start Analysis'
+			startBtn.style.pointerEvents = 'auto'
 		}
 	}
 
 	async stopAnalysis() {
+		const stopBtn = document.getElementById('stop-analysis-btn')
+
 		try {
 			const response = await fetch('/api/stop-analysis', {
 				method: 'POST',
@@ -1101,6 +1178,7 @@ class SportsAnalyticsDashboard {
 
 			if (response.ok) {
 				this.showUploadStatus('Analysis stopped', 'warning')
+				this.isStopButtonLoading = false
 				this.updateProcessingStatus(false)
 			} else {
 				throw new Error(result.detail || 'Failed to stop analysis')
@@ -1110,6 +1188,11 @@ class SportsAnalyticsDashboard {
 				`Failed to stop analysis: ${error.message}`,
 				'danger'
 			)
+			// Clear loading flag and re-enable stop button on error
+			this.isStopButtonLoading = false
+			stopBtn.disabled = false
+			stopBtn.innerHTML = '<i class="fas fa-stop me-2"></i>Stop Analysis'
+			stopBtn.style.pointerEvents = 'auto'
 		}
 	}
 
@@ -1136,14 +1219,38 @@ class SportsAnalyticsDashboard {
 		if (isProcessing) {
 			statusDiv.innerHTML =
 				'<i class="fas fa-circle text-success me-2"></i><span>Processing</span>'
-			startBtn.disabled = true
-			stopBtn.disabled = false
+
+			// Only update button states if not in loading state
+			if (!this.isStartButtonLoading) {
+				startBtn.disabled = true
+				startBtn.innerHTML =
+					'<i class="fas fa-play me-2"></i>Start Analysis'
+				startBtn.style.pointerEvents = 'auto'
+			}
+			if (!this.isStopButtonLoading) {
+				stopBtn.disabled = false
+				stopBtn.innerHTML =
+					'<i class="fas fa-stop me-2"></i>Stop Analysis'
+				stopBtn.style.pointerEvents = 'auto'
+			}
 			selectUploadBtn.disabled = true
 		} else {
 			statusDiv.innerHTML =
 				'<i class="fas fa-circle text-secondary me-2"></i><span>Ready</span>'
-			startBtn.disabled = !currentVideo
-			stopBtn.disabled = true
+
+			// Only update button states if not in loading state
+			if (!this.isStartButtonLoading) {
+				startBtn.disabled = !currentVideo
+				startBtn.innerHTML =
+					'<i class="fas fa-play me-2"></i>Start Analysis'
+				startBtn.style.pointerEvents = 'auto'
+			}
+			if (!this.isStopButtonLoading) {
+				stopBtn.disabled = true
+				stopBtn.innerHTML =
+					'<i class="fas fa-stop me-2"></i>Stop Analysis'
+				stopBtn.style.pointerEvents = 'auto'
+			}
 
 			// Reset upload button if not processing and no video uploaded
 			if (!currentVideo) {
@@ -1270,5 +1377,6 @@ class SportsAnalyticsDashboard {
 
 // Initialize dashboard when DOM is loaded
 document.addEventListener('DOMContentLoaded', () => {
+	console.log('Dashboard JavaScript loaded at:', new Date().toISOString())
 	window.dashboard = new SportsAnalyticsDashboard()
 })
