@@ -47,7 +47,6 @@ The system is built with a clean, modular architecture:
 
     ```bash
     git clone <repository-url>
-    cd hackathon-test
     ```
 
 2. **Install dependencies**:
